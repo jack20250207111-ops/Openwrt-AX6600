@@ -1,3 +1,4 @@
+加开科学上网
 # OpenWRT-CI
 云编译OpenWRT固件
 
