@@ -51,10 +51,10 @@ UPDATE_PACKAGE "aurora-config" "ones20250/luci-app-aurora-config" "master"
 #UPDATE_PACKAGE "kucat" "sirpdboy/luci-theme-kucat" "master"
 #UPDATE_PACKAGE "kucat-config" "sirpdboy/luci-app-kucat-config" "master"
 
-UPDATE_PACKAGE "homeproxy" "ones20250/homeproxy" "main"
+UPDATE_PACKAGE "homeproxy" "ones20250/homeproxy" "master"
 UPDATE_PACKAGE "momo" "nikkinikki-org/OpenWrt-momo" "main"
 UPDATE_PACKAGE "nikki" "nikkinikki-org/OpenWrt-nikki" "main"
-UPDATE_PACKAGE "openclash" "vernesong/OpenClash" "main" "pkg"
+UPDATE_PACKAGE "openclash" "vernesong/OpenClash" "master" "pkg"
 #UPDATE_PACKAGE "passwall" "Openwrt-Passwall/openwrt-passwall" "main" "pkg"
 UPDATE_PACKAGE "passwall2" "Openwrt-Passwall/openwrt-passwall2" "main" "pkg"
 
