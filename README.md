@@ -1,6 +1,7 @@
-# 🚀 OpenWrt AX6600 / IPQ60xx 云编译固件 
-[👉 进入项目主页](https://github.com/ones20250/Openwrt-AX6600) （仅支持京东云雅典娜 AX6600）
+# 🚀 OpenWrt AX6600 / IPQ60xx Router Firmware Cloud Build (NSS Accelerated)
+OpenWrt / AX6600 / JDCloud RE-CS-02 / IPQ6010 / NSS acceleration / firmware / router / cloud build
 
+[👉 进入项目主页](https://github.com/ones20250/Openwrt-AX6600) 适配京东云雅典娜 AX6600（JDCloud RE-CS-02）
 
 一个基于 GitHub Actions 的 OpenWrt 自动编译项目，支持 QUALCOMMAX（IPQ6010）系列设备。
 
@@ -8,11 +9,13 @@
 
 ## ⭐ 项目特点
 
-- 🔥 云编译 OpenWrt（无需本地环境）
-- 📦 适用于京东云雅典娜 AX6600
-- 🚀 集成常用插件
-- ⚡ 支持 NSS 硬件加速
-- 🔄 自动跟踪上游源码更新
+- 🔥 OpenWrt 云编译（GitHub Actions 自动构建）
+- 📦 适配京东云雅典娜 AX6600（RE-CS-02）
+- 🚀 预装常用网络插件
+- ⚡ 支持 NSS 硬件加速（性能优化）
+- 🌐 提升 NAT / 转发 / 吞吐性能
+- 🔄 自动同步上游 OpenWrt / ImmortalWrt 源码
+- 🧩 支持自定义编译配置
 
 ---
 
@@ -42,6 +45,7 @@
 - 默认包含基础网络功能
 - 可通过自定义配置增加插件
 - 基于 QUALCOMMAX（IPQ6010）平台
+- 针对 IPQ6010 平台进行网络性能优化
 
 ---
 
