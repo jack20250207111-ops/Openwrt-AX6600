@@ -1,7 +1,7 @@
 # 🚀 OpenWrt AX6600 / IPQ60xx Router Firmware (Cloud Build + NSS Acceleration)
 
 OpenWrt / AX6600 / IPQ6010 / JDCloud RE-CS-02 / NSS / Router Firmware / Cloud Build
-> 基于 OpenWrt / ImmortalWrt 的定制固件，适配 JDCloud RE-CS-02（雅典娜 AX6600），集成 NSS 硬件加速优化与 GitHub Actions 自动云编译
+> 基于 OpenWrt / ImmortalWrt 的定制固件，适配 JDCloud RE-CS-02（京东云雅典娜 AX6600），集成 NSS 硬件加速优化与 GitHub Actions 自动云编译
 
 [👉 进入项目主页](https://github.com/ones20250/Openwrt-AX6600)
 ---
