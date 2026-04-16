@@ -104,6 +104,15 @@ jobs:
           if [ -f "$PROJECT_MIRRORS_FILE" ]; then
             sed -i '/.cn\//d; /tencent/d; /aliyun/d' "$PROJECT_MIRRORS_FILE"
           fi
+          
+      - name: Add Passwall Feeds
+        run: |
+          cd ./wrt/
+          cat >> feeds.conf.default << 'EOF'
+          src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages
+          src-git passwall_luci https://github.com/xiaorouji/openwrt-passwall
+          EOF
+
 
       - name: Check Scripts
         run: |
