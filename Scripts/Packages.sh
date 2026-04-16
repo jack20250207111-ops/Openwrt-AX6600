@@ -58,6 +58,7 @@ UPDATE_PACKAGE() {
 #UPDATE_PACKAGE "openclash" "vernesong/OpenClash" "master" "pkg"
 #UPDATE_PACKAGE "passwall" "Openwrt-Passwall/openwrt-passwall" "main" "pkg"
 #UPDATE_PACKAGE "passwall2" "Openwrt-Passwall/openwrt-passwall2" "main" "pkg"
+UPDATE_PACKAGE "xray-core" "XTLS/Xray-core" "main"
 
 #UPDATE_PACKAGE "mosdns" "sbwml/luci-app-mosdns" "v5" "" "v2dat"
 
