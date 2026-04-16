@@ -109,8 +109,8 @@ jobs:
         run: |
           cd ./wrt/
           cat >> feeds.conf.default << 'EOF'
-          src-git passwall_packages https://github.com/xiaorouji/openwrt-passwall-packages
-          src-git passwall_luci https://github.com/xiaorouji/openwrt-passwall
+          src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages
+          src-git passwall_luci https://github.com/Openwrt-Passwall/openwrt-passwall
           EOF
 
 
