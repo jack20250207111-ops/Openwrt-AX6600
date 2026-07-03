@@ -34,6 +34,7 @@ jobs:
       matrix:
         #CONFIG: [IPQ60XX-WIFI-YES, IPQ60XX-WIFI-NO, IPQ807X-WIFI-YES, IPQ807X-WIFI-NO]
         CONFIG: [IPQ60XX-WIFI-YES]
+        PROFILE: [PURE, RICH]
         SOURCE: [ones20250/immortalwrt_ipq]
         BRANCH: [main]
 
@@ -63,5 +64,7 @@ jobs:
       WRT_SOURCE: ${{matrix.SOURCE}}
       #插件调整
       WRT_PACKAGE: ${{inputs.PACKAGE}}
+      #固件版本：PURE=纯净版，RICH=丰富版
+      WRT_PROFILE: ${{matrix.PROFILE}}
       #仅输出配置文件
       WRT_TEST: ${{inputs.TEST}}

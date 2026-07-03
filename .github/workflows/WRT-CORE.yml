@@ -37,6 +37,10 @@ on:
       WRT_PACKAGE:
         required: false
         type: string
+      WRT_PROFILE:
+        required: false
+        type: string
+        default: PURE
       WRT_TEST:
         required: false
         type: string
@@ -54,6 +58,8 @@ env:
   WRT_BRANCH: ${{inputs.WRT_BRANCH}}
   WRT_SOURCE: ${{inputs.WRT_SOURCE}}
   WRT_PACKAGE: ${{inputs.WRT_PACKAGE}}
+  WRT_PROFILE: ${{inputs.WRT_PROFILE}}
+  WRT_PKG_INFO: none
   WRT_TEST: ${{inputs.WRT_TEST}}
 
 jobs:
@@ -62,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Projects
-        uses: actions/checkout@main
+        uses: actions/checkout@v4
 
       - name: Initialization Environment
         env:
@@ -87,9 +93,16 @@ jobs:
         run: |
           echo "WRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
           echo "WRT_MARK=${GITHUB_REPOSITORY%%/*}" >> $GITHUB_ENV
+          WRT_PROFILE_UPPER=$(echo "${WRT_PROFILE:-PURE}" | tr '[:lower:]' '[:upper:]')
+          case "$WRT_PROFILE_UPPER" in
+            PURE|RICH) ;;
+            *) echo "Unsupported WRT_PROFILE: $WRT_PROFILE" >&2; exit 1 ;;
+          esac
+          echo "WRT_PROFILE=$WRT_PROFILE_UPPER" >> $GITHUB_ENV
           echo "WRT_INFO=${WRT_SOURCE%%/*}" >> $GITHUB_ENV
           echo "WRT_TARGET=$(grep -m 1 -oP '^CONFIG_TARGET_\K[\w]+(?=\=y)' ./Config/$WRT_CONFIG.txt)" >> $GITHUB_ENV
           echo "WRT_WIFI=wifi-yes" >> $GITHUB_ENV
+          echo "WRT_EXTRA_CONFIG=$([[ -f ./Config/GENERAL_AX6600_${WRT_PROFILE_UPPER}.txt ]] && echo ./Config/GENERAL_AX6600_${WRT_PROFILE_UPPER}.txt || true)" >> $GITHUB_ENV
           echo "WRT_KVER=none" >> $GITHUB_ENV
           echo "WRT_LIST=none" >> $GITHUB_ENV
 
@@ -105,6 +118,15 @@ jobs:
             sed -i '/.cn\//d; /tencent/d; /aliyun/d' "$PROJECT_MIRRORS_FILE"
           fi
 
+          # 丰富版补充 PassWall feeds，避免只生成依赖包但 LuCI 插件未进入最终固件。
+          if [[ "$WRT_PROFILE" == "RICH" ]]; then
+            {
+              echo "src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages"
+              echo "src-git passwall_luci https://github.com/Openwrt-Passwall/openwrt-passwall"
+              echo "src-git passwall2_luci https://github.com/Openwrt-Passwall/openwrt-passwall2"
+            } >> feeds.conf.default
+          fi
+
       - name: Check Scripts
         run: |
           find ./ -maxdepth 3 -type f -iregex ".*\(txt\|sh\)$" -exec dos2unix {} \; -exec chmod +x {} \;
@@ -112,10 +134,10 @@ jobs:
       - name: Check Caches
         id: check-cache
         if: env.WRT_TEST != 'true'
-        uses: actions/cache@main
+        uses: actions/cache@v4
         with:
-          key: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_HASH}}
-          restore-keys: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}
+          key: ${{env.WRT_CONFIG}}-${{env.WRT_PROFILE}}-${{env.WRT_INFO}}-${{env.WRT_HASH}}
+          restore-keys: ${{env.WRT_CONFIG}}-${{env.WRT_PROFILE}}-${{env.WRT_INFO}}
           path: |
             ./wrt/.ccache
             ./wrt/staging_dir/host*
@@ -137,7 +159,7 @@ jobs:
           fi
 
           if ${{steps.check-cache.outputs.cache-hit != 'true'}}; then
-            CACHE_LIST=$(gh cache list --key "$WRT_CONFIG-$WRT_INFO" | cut -f 1)
+            CACHE_LIST=$(gh cache list --key "$WRT_CONFIG-$WRT_PROFILE-$WRT_INFO" | cut -f 1)
             for CACHE_KEY in $CACHE_LIST; do
               gh cache delete $CACHE_KEY
             done
@@ -159,7 +181,15 @@ jobs:
         run: |
           cd ./wrt/package/
 
+          : > "$GITHUB_WORKSPACE/package-versions.txt"
           $GITHUB_WORKSPACE/Scripts/Packages.sh
+          if [ -s "$GITHUB_WORKSPACE/package-versions.txt" ]; then
+            {
+              echo 'WRT_PKG_INFO<<EOF'
+              cat "$GITHUB_WORKSPACE/package-versions.txt"
+              echo 'EOF'
+            } >> "$GITHUB_ENV"
+          fi
           #$GITHUB_WORKSPACE/Scripts/Handles.sh
 
       - name: Custom Settings
@@ -170,7 +200,7 @@ jobs:
             cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt >> .config
           else
             #cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt $GITHUB_WORKSPACE/Config/GENERAL.txt >> .config
-            cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt $GITHUB_WORKSPACE/Config/GENERAL_AX6600.txt >> .config
+            cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt $GITHUB_WORKSPACE/Config/GENERAL_AX6600.txt ${WRT_EXTRA_CONFIG:+$GITHUB_WORKSPACE/${WRT_EXTRA_CONFIG#./}} >> .config
           fi
 
           $GITHUB_WORKSPACE/Scripts/Settings.sh
@@ -207,7 +237,10 @@ jobs:
         run: |
           cd ./wrt/ && mkdir -p ./upload/
 
-          cp -f ./.config ./upload/Config-"$WRT_CONFIG"-"$WRT_INFO"-"$WRT_BRANCH"-"$WRT_DATE".txt
+          cp -f ./.config ./upload/Config-"$WRT_CONFIG"-"$WRT_PROFILE"-"$WRT_INFO"-"$WRT_BRANCH"-"$WRT_DATE".txt
+          if [ -s "$GITHUB_WORKSPACE/package-versions.txt" ]; then
+            cp -f "$GITHUB_WORKSPACE/package-versions.txt" ./upload/Packages-"$WRT_CONFIG"-"$WRT_PROFILE"-"$WRT_INFO"-"$WRT_BRANCH"-"$WRT_DATE".txt
+          fi
 
           if [[ $WRT_TEST != 'true' ]]; then
             echo "WRT_KVER=$(find ./bin/targets/ -type f -name "*.manifest" -exec grep -oP '^kernel - \K[\d\.]+' {} \;)" >> $GITHUB_ENV
@@ -218,7 +251,7 @@ jobs:
             for FILE in $(find ./bin/targets/ -type f -iname "*$WRT_TARGET*") ; do
               EXT=$(basename $FILE | cut -d '.' -f 2-)
               NAME=$(basename $FILE | cut -d '.' -f 1 | grep -io "\($WRT_TARGET\).*")
-              NEW_FILE="$WRT_INFO"-"$WRT_BRANCH"-"$WRT_WIFI"-"$NAME"-"$WRT_DATE"."$EXT"
+              NEW_FILE="$WRT_INFO"-"$WRT_BRANCH"-"${WRT_PROFILE,,}"-"$WRT_WIFI"-"$NAME"-"$WRT_DATE"."$EXT"
               mv -f $FILE ./upload/$NEW_FILE
             done
 
@@ -235,6 +268,7 @@ jobs:
             echo "- Source: \`$WRT_SOURCE\`"
             echo "- Branch: \`$WRT_BRANCH\`"
             echo "- Config: \`$WRT_CONFIG\`"
+            echo "- Profile: \`$WRT_PROFILE\`"
             echo "- Target: \`$WRT_TARGET\`"
             echo "- Firmware mode: \`$WRT_WIFI\`"
             echo "- Build time: \`$WRT_DATE\`"
@@ -242,9 +276,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Release Firmware
-        uses: softprops/action-gh-release@master
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.WRT_CONFIG }}-${{ env.WRT_INFO }}-${{ env.WRT_BRANCH }}-${{ env.WRT_DATE }}
+          tag_name: ${{ env.WRT_CONFIG }}-${{ env.WRT_PROFILE }}-${{ env.WRT_INFO }}-${{ env.WRT_BRANCH }}-${{ env.WRT_DATE }}
           files: ./wrt/upload/*.*
           body: |
             📦 OpenWrt 自动编译固件（AX6600 / IPQ6010）
@@ -253,8 +287,13 @@ jobs:
             📌 基本信息
             源码仓库：${{ env.WRT_REPO }}
             编译分支：${{ env.WRT_BRANCH }}
+            固件版本：${{ env.WRT_PROFILE }}
             提交版本：${{ env.WRT_HASH }}
             编译时间：${{ env.WRT_DATE }}
+            ━━━━━━━━━━━━━━━━━━━━━━━
+
+            📌 外部插件来源
+            ${{ env.WRT_PKG_INFO }}
             ━━━━━━━━━━━━━━━━━━━━━━━
 
             🧩 设备与平台

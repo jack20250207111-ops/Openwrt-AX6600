@@ -66,12 +66,32 @@ OpenWrt / AX6600 / IPQ6010 / JDCloud RE-CS-02 / NSS / Router Firmware / Cloud Bu
 | 说明 | 详情 |
 |------|------|
 | **编译时间** | 显示的时间为编译开始时间，用于对应上游源码版本 |
-| **基础功能** | 默认包含完整网络功能栈 |
-| **扩展插件** | 可通过自定义配置 `.config` 文件增加额外插件 |
+| **版本划分** | 默认同时构建 `PURE` 纯净版与 `RICH` 丰富版 |
+| **基础功能** | 纯净版保持当前轻量配置，包含完整网络功能栈 |
+| **扩展插件** | 丰富版额外集成 Docker / Dockerman、PassWall / PassWall2、OpenClash、AdGuard Home 等常用组件，也可通过自定义配置 `.config` 文件继续增加插件 |
 | **硬件平台** | 基于 QUALCOMMAX（IPQ6010）架构 |
 | **性能优化** | 针对 IPQ6010 平台进行网络性能调优 |
 
 ---
+
+
+### 固件版本
+
+| 版本 | 适合人群 | 预置内容 |
+|------|----------|----------|
+| `PURE` 纯净版 | 希望系统轻量、稳定，按需自行安装插件的用户 | 保持当前配置，预装基础网络与常用管理插件 |
+| `RICH` 丰富版 | 希望刷完即用常见扩展服务的用户 | 在纯净版基础上增加 Docker / Dockerman、PassWall / PassWall2、OpenClash、AdGuard Home |
+
+> 💡 Releases 中的文件名会包含 `pure` 或 `rich`，请按需求下载对应版本。
+
+### 版本与验证建议
+
+- `PURE`：推荐作为日常稳定版，保持当前轻量配置。
+- `RICH`：丰富版会额外集成 Docker / Dockerman、PassWall / PassWall2、OpenClash、AdGuard Home，固件体积和运行资源占用都会明显高于纯净版。
+- 手动测试时可在 `WRT-TEST` 工作流选择 `PROFILE=PURE` 或 `PROFILE=RICH`；建议丰富版发布前至少先用 `TEST=true` 生成最终 `.config`，再用完整编译确认上游插件依赖没有变化。
+- Release 会额外上传 `Packages-*.txt` 记录丰富版外部插件仓库、分支和 commit，方便排查 OpenClash / PassWall / PassWall2 上游变更导致的编译问题。丰富版还会额外加入 PassWall/PassWall2 feeds，并显式拉取 `luci-app-passwall` 与 `luci-app-passwall2`，避免出现“编译成功但系统里没有插件入口”的情况。
+
+> ⚠️ 丰富版依赖外部插件仓库和上游 feeds，若上游调整包名或依赖，可能需要同步更新 `Config/GENERAL_AX6600_RICH.txt`。
 
 ## 📂 项目结构
 

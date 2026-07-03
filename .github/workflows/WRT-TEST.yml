@@ -37,6 +37,14 @@ on:
       PACKAGE:
         required: false
         type: string
+      PROFILE:
+        description: '固件版本：PURE=纯净版，RICH=丰富版。'
+        default: 'PURE'
+        required: true
+        type: choice
+        options:
+          - PURE
+          - RICH
       TEST:
         description: '仅输出配置文件，不编译固件。'
         default: 'true'
@@ -75,5 +83,7 @@ jobs:
       WRT_SOURCE: ${{inputs.SOURCE}}
       #插件调整
       WRT_PACKAGE: ${{inputs.PACKAGE}}
+      #固件版本
+      WRT_PROFILE: ${{inputs.PROFILE}}
       #仅输出配置文件
       WRT_TEST: ${{inputs.TEST}}
