@@ -3,6 +3,11 @@
 OpenWrt / AX6600 / IPQ6010 / JDCloud RE-CS-02 / NSS / Router Firmware / Cloud Build
 > 基于 OpenWrt / ImmortalWrt 的定制固件，适配 JDCloud RE-CS-02（京东云雅典娜 AX6600），集成 NSS 硬件加速优化与 GitHub Actions 自动云编译
 
+[![Stars](https://img.shields.io/github/stars/ones20250/Openwrt-AX6600?style=flat&logo=github&label=Stars)](https://github.com/ones20250/Openwrt-AX6600/stargazers)
+[![Downloads](https://img.shields.io/github/downloads/ones20250/Openwrt-AX6600/total?logo=github&label=%E4%B8%8B%E8%BD%BD%E9%87%8F)](https://github.com/ones20250/Openwrt-AX6600/releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/ones20250/Openwrt-AX6600/QCA-ALL.yml?label=%E7%BC%96%E8%AF%91)](https://github.com/ones20250/Openwrt-AX6600/actions)
+[![Release Date](https://img.shields.io/github/release-date/ones20250/Openwrt-AX6600?label=%E6%9C%80%E6%96%B0%E5%8F%91%E5%B8%83)](https://github.com/ones20250/Openwrt-AX6600/releases)
+
 [👉 进入项目主页](https://github.com/ones20250/Openwrt-AX6600)
 ---
 
@@ -26,6 +31,8 @@ OpenWrt / AX6600 / IPQ6010 / JDCloud RE-CS-02 / NSS / Router Firmware / Cloud Bu
 |------|----------|----------|
 | 🍃 `PURE` 纯净版 | 🎯 **[👉 下载最新 PURE 固件](https://github.com/ones20250/Openwrt-AX6600/releases?q=PURE&expanded=true)** | 轻量稳定，日常推荐，插件按需自装 |
 | 🚀 `PLUS` 版 | 🎯 **[👉 下载最新 PLUS 固件](https://github.com/ones20250/Openwrt-AX6600/releases?q=PLUS&expanded=true)** | Docker / PassWall / OpenClash / AdGuard Home 开箱即用 |
+
+> ⭐ 固件对你有用的话，顺手点个 Star —— 这是对持续维护最好的支持！
 
 > 💡 打开后列表**最上方**即为该版本最新固件；也可浏览 [全部 Releases](https://github.com/ones20250/Openwrt-AX6600/releases)。
 
