@@ -16,7 +16,7 @@ OpenWrt / AX6600 / IPQ6010 / JDCloud RE-CS-02 / NSS / Router Firmware / Cloud Bu
 - 🔥 **云编译构建** - 基于 GitHub Actions 完全自动化编译
 - 📦 **官方支持** - 完美适配京东云雅典娜AX6600（RE-CS-02）
 - 💡 **点阵屏控制** - 内置雅典娜 LED 点阵屏驱动与管理界面（athena-led）
-- 🚀 **开箱即用** - 预装常用网络工具与插件
+- 🚀 **开箱即用** - 预装常用网络工具、USB 打印机共享与插件
 - ⚡ **硬件加速** - 原生支持 NSS 硬件加速引擎
 - 📶 **WiFi 稳定** - 无线驱动内存与系统水位线深度调优，7×24 高负载久跑不断流
 - 🌐 **性能优化** - 显著提升 NAT/转发/吞吐性能
@@ -51,7 +51,7 @@ OpenWrt / AX6600 / IPQ6010 / JDCloud RE-CS-02 / NSS / Router Firmware / Cloud Bu
 |------|------|
 | **编译时间** | 显示的时间为编译开始时间，用于对应上游源码版本 |
 | **版本划分** | 默认同时构建 `PURE` 纯净版与 `PLUS` 版 |
-| **基础功能** | 纯净版保持当前轻量配置，包含完整网络功能栈 |
+| **基础功能** | 纯净版保持当前轻量配置，包含完整网络功能栈、Samba 文件共享与 USB 打印机共享 |
 | **扩展插件** | Plus 版额外集成 OpenClash、PassWall2、Docker / Dockerman、AdGuard Home、DDNS、ttyd 终端、UPnP 等常用组件，也可通过自定义配置 `.config` 文件增加插件 |
 | **硬件平台** | 基于 QUALCOMMAX（IPQ6010）架构 |
 | **性能优化** | 针对 IPQ6010 平台进行网络性能调优 |
@@ -60,7 +60,7 @@ OpenWrt / AX6600 / IPQ6010 / JDCloud RE-CS-02 / NSS / Router Firmware / Cloud Bu
 
 | 版本 | 适合人群 | 预置内容 |
 |------|----------|----------|
-| `PURE` 纯净版 | 希望系统轻量、稳定，按需自行安装插件的用户 | 保持当前配置，预装基础网络与常用管理插件 |
+| `PURE` 纯净版 | 希望系统轻量、稳定，按需自行安装插件的用户 | 保持当前配置，预装基础网络、USB 打印机共享与常用管理插件 |
 | `PLUS` 版 | 希望刷完即用常见扩展服务的用户 | 在纯净版基础上增加 OpenClash、PassWall2、Docker / Dockerman、AdGuard Home、DDNS、ttyd 终端、UPnP，以及分区扩容（partexp）、网络唤醒（wolplus）等实用插件 |
 
 > 💡 Releases 中的文件名会包含 `pure` 或 `plus`，请按需求下载对应版本。
