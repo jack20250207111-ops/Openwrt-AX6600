@@ -1,6 +1,7 @@
 #!/bin/sh
 # Real Docker End-to-End Drill Script for AX6600 Docker Upgrade Helper
-# Designed to run in real Linux environments with active Docker daemon
+# Designed to run in isolated Docker environments (e.g. DinD or dedicated test runners)
+# NEVER damages or stops host business containers.
 set -eu
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
@@ -15,7 +16,7 @@ log_err() {
     echo "[DRILL ERROR] $*" >&2
 }
 
-# 1. Check prerequisites
+# 1. 检查 Docker 命令基础可用性
 if ! command -v docker >/dev/null 2>&1; then
     log_err "Docker 未安装或不在 PATH 中，跳过真实 Docker 演练。"
     exit 0
@@ -26,58 +27,233 @@ if ! docker info >/dev/null 2>&1; then
     exit 0
 fi
 
-# 2. Setup drill working directories
-DRILL_ROOT=$(mktemp -d "/tmp/ax6600_docker_drill_XXXXXX" 2>/dev/null || mktemp -d -t 'ax6600_drill')
+ISOLATED_MODE=0
+ALLOW_HOST=0
+for arg in "$@"; do
+    case "$arg" in
+        --isolated)
+            ISOLATED_MODE=1
+            ;;
+        --allow-host)
+            ALLOW_HOST=1
+            ;;
+    esac
+done
+
+if [ -f /.dockerenv ] || [ "${AX6600_DRILL_ISOLATED:-0}" = "1" ]; then
+    ISOLATED_MODE=1
+fi
+
+# 2. 宿主安全防护：严禁在共享业务 Docker 宿主直接运行 helper 停机备份
+if [ "$ISOLATED_MODE" -eq 0 ]; then
+    RUNNING_CONTAINERS=$(docker ps -q 2>/dev/null || true)
+    if [ -n "$RUNNING_CONTAINERS" ] && [ "$ALLOW_HOST" -eq 0 ]; then
+        log "检测到当前宿主机存在运行中的业务容器 ($(echo "$RUNNING_CONTAINERS" | wc -w) 个)。"
+        log "为防止 helper 停机冷备中断宿主机其他业务容器，自动启动专用隔离 DinD (Docker-in-Docker) 容器执行演练..."
+        exec docker run --rm --privileged \
+            -e AX6600_DRILL_ISOLATED=1 \
+            -v "$REPO_ROOT:/workspace" \
+            -w /workspace \
+            docker:dind sh -c '
+                dockerd-entrypoint.sh dockerd >/dev/null 2>&1 &
+                n=0
+                while [ $n -lt 30 ]; do
+                    if docker info >/dev/null 2>&1; then
+                        break
+                    fi
+                    n=$((n + 1))
+                    sleep 1
+                done
+                if [ $n -ge 30 ]; then
+                    echo "[DRILL ERROR] DinD 内部 dockerd 启动超时！" >&2
+                    exit 1
+                fi
+                /workspace/tests/drill_real_docker.sh --isolated
+            '
+    fi
+    if [ "$ALLOW_HOST" -eq 0 ] && [ -z "$RUNNING_CONTAINERS" ]; then
+        log "提示: 当前无运行容器，如需直接在当前机器运行请指定 --allow-host 或 --isolated。"
+        log "正在通过隔离容器执行演练..."
+        exec docker run --rm --privileged \
+            -e AX6600_DRILL_ISOLATED=1 \
+            -v "$REPO_ROOT:/workspace" \
+            -w /workspace \
+            docker:dind sh -c '
+                dockerd-entrypoint.sh dockerd >/dev/null 2>&1 &
+                n=0
+                while [ $n -lt 30 ]; do
+                    if docker info >/dev/null 2>&1; then
+                        break
+                    fi
+                    n=$((n + 1))
+                    sleep 1
+                done
+                if [ $n -ge 30 ]; then
+                    echo "[DRILL ERROR] DinD 内部 dockerd 启动超时！" >&2
+                    exit 1
+                fi
+                /workspace/tests/drill_real_docker.sh --isolated
+            '
+    fi
+fi
+
+# 3. 准备隔离存储挂载点（绝不在 /tmp 下建立备份，防止被 check_mount_safety 拒绝）
+DRILL_LOOP_DEV=""
+DRILL_LOOP_MNT=""
+DRILL_ROOT=""
+
+cleanup_drill_storage() {
+    if [ -n "$DRILL_LOOP_MNT" ] && [ -d "$DRILL_LOOP_MNT" ]; then
+        umount "$DRILL_LOOP_MNT" 2>/dev/null || true
+        rm -rf "$DRILL_LOOP_MNT" 2>/dev/null || true
+    fi
+    if [ -n "$DRILL_LOOP_DEV" ] && [ -f "$DRILL_LOOP_DEV" ]; then
+        rm -f "$DRILL_LOOP_DEV" 2>/dev/null || true
+    fi
+}
+
+if [ -n "${DRILL_STORAGE_ROOT:-}" ] && [ -d "$DRILL_STORAGE_ROOT" ]; then
+    DRILL_ROOT="$DRILL_STORAGE_ROOT/ax6600_drill_$$"
+elif [ "$(id -u)" = "0" ] && command -v mount >/dev/null 2>&1 && command -v truncate >/dev/null 2>&1 && command -v mkfs.ext4 >/dev/null 2>&1; then
+    # 使用 loopback ext4 独立挂载，既不污染宿主，又完美满足非 rootfs / 非 tmpfs 外部存储安全核验
+    DRILL_LOOP_DEV="/var/run/ax6600_drill_loop_$$.img"
+    DRILL_LOOP_MNT="/mnt/ax6600_drill_$$"
+    mkdir -p /var/run "$DRILL_LOOP_MNT"
+    truncate -s 256M "$DRILL_LOOP_DEV"
+    mkfs.ext4 -F "$DRILL_LOOP_DEV" >/dev/null 2>&1
+    mount -o loop "$DRILL_LOOP_DEV" "$DRILL_LOOP_MNT"
+    DRILL_ROOT="$DRILL_LOOP_MNT/drill_root"
+else
+    # 备用方案：在非 /tmp 的 /var 目录组织测试目录
+    DRILL_ROOT="/var/ax6600_drill_$$"
+fi
+
 DRILL_BACKUP="$DRILL_ROOT/backup_target"
 DRILL_RESTORE_DATA="$DRILL_ROOT/restored_dataroot"
 DRILL_BIND_SRC="$DRILL_ROOT/host_bind_data"
 DRILL_COMPOSE_DIR="$DRILL_ROOT/compose_proj"
+DRILL_SYS_ROOT="$DRILL_ROOT/mock_sys_root"
+DRILL_BIN="$DRILL_ROOT/bin"
 
-mkdir -p "$DRILL_BACKUP" "$DRILL_RESTORE_DATA" "$DRILL_BIND_SRC" "$DRILL_COMPOSE_DIR"
+mkdir -p "$DRILL_BACKUP" "$DRILL_RESTORE_DATA" "$DRILL_BIND_SRC" "$DRILL_COMPOSE_DIR" "$DRILL_SYS_ROOT" "$DRILL_BIN"
+
+# 4. 初始化模拟 OpenWrt 服务脚本与工具（解决普通 Linux 缺失 /etc/init.d/dockerd 与 uci 的问题）
+cat << 'EOF' > "$DRILL_SYS_ROOT/etc_init_dockerd"
+#!/bin/sh
+cmd="$1"
+case "$cmd" in
+    enabled)
+        [ "$(cat "$DRILL_SYS_ROOT/dockerd_enabled" 2>/dev/null || echo 0)" = "1" ] && exit 0 || exit 1
+        ;;
+    enable)
+        echo "1" > "$DRILL_SYS_ROOT/dockerd_enabled"
+        exit 0
+        ;;
+    disable)
+        echo "0" > "$DRILL_SYS_ROOT/dockerd_enabled"
+        exit 0
+        ;;
+    start|stop|restart)
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+EOF
+mkdir -p "$DRILL_SYS_ROOT/etc/init.d" "$DRILL_SYS_ROOT/etc/config" "$DRILL_SYS_ROOT/etc/docker"
+cp "$DRILL_SYS_ROOT/etc_init_dockerd" "$DRILL_SYS_ROOT/etc/init.d/dockerd"
+chmod +x "$DRILL_SYS_ROOT/etc/init.d/dockerd"
+echo "1" > "$DRILL_SYS_ROOT/dockerd_enabled"
+
+cat << 'EOF' > "$DRILL_BIN/uci"
+#!/bin/sh
+cmd="$1"
+shift || true
+case "$cmd" in
+    get|-q)
+        [ "$cmd" = "-q" ] && { cmd="$1"; shift || true; }
+        case "${1:-}" in
+            dockerd.globals.data_root)
+                cat "$DRILL_SYS_ROOT/etc/config/dockerd.data_root" 2>/dev/null || echo ""
+                exit 0
+                ;;
+            *)
+                exit 0
+                ;;
+        esac
+        ;;
+    set)
+        key=$(echo "${1:-}" | cut -d= -f1)
+        val=$(echo "${1:-}" | cut -d= -f2-)
+        if [ "$key" = "dockerd.globals.data_root" ]; then
+            echo "$val" > "$DRILL_SYS_ROOT/etc/config/dockerd.data_root"
+        fi
+        exit 0
+        ;;
+    commit)
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+EOF
+chmod +x "$DRILL_BIN/uci"
+ORIG_PATH="$PATH"
+PATH="$DRILL_BIN:$PATH"
+export PATH
+
+# 动态独立资源名称（避免名称碰撞）
+CONTAINER_NAME="drill_standalone_$$"
+SNAPSHOT_IMAGE="backup-snapshot-${CONTAINER_NAME}:latest"
 
 cleanup() {
-    log "正在清理真实演练容器与临时目录..."
-    docker rm -f drill_standalone drill_compose_app 2>/dev/null || true
-    docker rmi -f backup-snapshot-drill_standalone:latest 2>/dev/null || true
-    rm -rf "$DRILL_ROOT"
+    log "正在清理真实演练容器与临时资源..."
+    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+    docker rmi -f "$SNAPSHOT_IMAGE" 2>/dev/null || true
+    rm -rf "$DRILL_ROOT" 2>/dev/null || true
+    cleanup_drill_storage
+    PATH="$ORIG_PATH"
 }
 trap cleanup EXIT INT TERM
 
-log "=== 开始 AX6600 Docker 真实环境端到端演练 ==="
+log "=== 开始 AX6600 Docker 真实环境端到端隔离演练 ==="
 log "演练临时根目录: $DRILL_ROOT"
 
 # 准备持久化绑定数据
 echo "secret_bind_payload_v1" > "$DRILL_BIND_SRC/app_config.env"
 echo "host_persistent_state_42" > "$DRILL_BIND_SRC/state.db"
 
-# 3. 准备并启动真实独立容器 (包含环境变量、多段入口点、端口绑定与宿主卷挂载)
-log "正在拉起演练独立容器 drill_standalone..."
-docker rm -f drill_standalone 2>/dev/null || true
+# 5. 准备并启动真实独立容器
+log "正在拉起演练独立容器 $CONTAINER_NAME..."
+docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
 TEST_IMAGE="alpine:latest"
 if ! docker image inspect "$TEST_IMAGE" >/dev/null 2>&1; then
     docker pull "$TEST_IMAGE" || true
 fi
 
-# 启动容器并写入运行时数据
+# 启动容器时执行无害长驻进程，防止恢复启动时重写覆盖测试数据
 docker run -d \
-    --name drill_standalone \
+    --name "$CONTAINER_NAME" \
     --restart unless-stopped \
     -e DRILL_ENV_VAR="ax6600_test_val_999" \
     -v "$DRILL_BIND_SRC:/data_host" \
-    "$TEST_IMAGE" sh -c "echo 'container_internal_dirty_page' > /data_runtime.txt; sleep 3600"
+    "$TEST_IMAGE" sleep 3600
 
 sleep 1
 
-# 写入容器可写层变动
-docker exec drill_standalone sh -c "echo 'flush_data_before_shutdown' >> /data_runtime.txt"
+# 在容器运行时写入可写层脏数据（该数据将被 commit 保存入快照镜像）
+docker exec "$CONTAINER_NAME" sh -c "echo 'flush_data_before_shutdown' > /data_runtime.txt"
 
-# 4. 执行真实备份 (调用 helper 备份)
+# 6. 执行真实冷备 (调用 helper 备份)
 log "执行 helper 备份..."
 sh "$HELPER_SCRIPT" backup \
-    --target-dir "$DRILL_BACKUP"
+    --target-dir "$DRILL_BACKUP" \
+    --sys-root "$DRILL_SYS_ROOT"
 
-# 5. 校验备份一致性产物
+# 7. 校验备份一致性产物
 log "校验备份关键产物..."
 if [ ! -f "$DRILL_BACKUP/backup_manifest.txt" ] || [ ! -f "$DRILL_BACKUP/sha256sums.txt" ]; then
     log_err "备份清单缺失！"
@@ -89,31 +265,32 @@ fi
     exit 1
 }
 
-if [ ! -f "$DRILL_BACKUP/standalone/recreate_drill_standalone.sh" ]; then
-    log_err "独立容器重建脚本未生成！"
+if [ ! -f "$DRILL_BACKUP/standalone/recreate_${CONTAINER_NAME}.sh" ]; then
+    log_err "独立容器重建脚本未生成: recreate_${CONTAINER_NAME}.sh"
     exit 1
 fi
 
-if [ ! -f "$DRILL_BACKUP/standalone/image_drill_standalone.tar" ]; then
-    log_err "独立容器快照镜像未导出！"
+if [ ! -f "$DRILL_BACKUP/standalone/image_${CONTAINER_NAME}.tar" ]; then
+    log_err "独立容器快照镜像未导出: image_${CONTAINER_NAME}.tar"
     exit 1
 fi
 
-# 6. 清理原容器与原宿主数据，准备恢复演练
+# 8. 销毁原始容器并清空原宿主测试数据，模拟换盘或固件重置
 log "销毁原始容器并清空测试数据，模拟换盘或固件重置..."
-docker rm -f drill_standalone 2>/dev/null || true
+docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 echo "corrupted_dirty_data" > "$DRILL_BIND_SRC/state.db"
 
-# 7. 执行恢复 (调用 helper 恢复至新 DataRoot)
+# 9. 执行恢复 (调用 helper 恢复至新 DataRoot)
 log "执行 helper 恢复..."
 sh "$HELPER_SCRIPT" restore \
     --backup-dir "$DRILL_BACKUP" \
-    --target-data-root "$DRILL_RESTORE_DATA"
+    --target-data-root "$DRILL_RESTORE_DATA" \
+    --sys-root "$DRILL_SYS_ROOT"
 
-# 8. 验收恢复结果
+# 10. 验收恢复结果
 log "验收容器运行状态与数据一致性..."
-if ! docker ps --format '{{.Names}}' | grep -q "drill_standalone"; then
-    log_err "独立容器 drill_standalone 未成功恢复运行！"
+if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+    log_err "独立容器 $CONTAINER_NAME 未成功恢复运行！"
     exit 1
 fi
 
@@ -125,18 +302,18 @@ if [ "$RESTORED_STATE" != "host_persistent_state_42" ]; then
 fi
 
 # 验证容器内部落盘数据（快照镜像还原）
-RESTORED_INTERNAL=$(docker exec drill_standalone cat /data_runtime.txt 2>/dev/null || echo "")
+RESTORED_INTERNAL=$(docker exec "$CONTAINER_NAME" cat /data_runtime.txt 2>/dev/null || echo "")
 if ! echo "$RESTORED_INTERNAL" | grep -q "flush_data_before_shutdown"; then
     log_err "容器内部快照数据未正确还原！实际值: $RESTORED_INTERNAL"
     exit 1
 fi
 
 # 验证容器环境变量
-RESTORED_ENV=$(docker exec drill_standalone env 2>/dev/null | grep "^DRILL_ENV_VAR=" | cut -d= -f2- || true)
+RESTORED_ENV=$(docker exec "$CONTAINER_NAME" env 2>/dev/null | grep "^DRILL_ENV_VAR=" | cut -d= -f2- || true)
 if [ "$RESTORED_ENV" != "ax6600_test_val_999" ]; then
     log_err "容器环境变量还原不匹配！实际值: $RESTORED_ENV"
     exit 1
 fi
 
-log "=== 真实 Docker 端到端演练全部通过！==="
+log "=== 真实 Docker 端到端隔离演练全部通过！==="
 exit 0

@@ -87,7 +87,11 @@ check_mount_safety() {
         exit 1
     fi
 
-    target_abs=$(cd "$check_dir" && pwd -P)
+    target_abs=$(cd "$check_dir" 2>/dev/null && pwd -P)
+    if [ -z "$target_abs" ]; then
+        log_error "无法解析 $label 目标绝对路径: $check_dir"
+        exit 1
+    fi
 
     df_out=$(df -P "$target_abs" 2>/dev/null || true)
     if [ -z "$df_out" ]; then
@@ -128,7 +132,15 @@ check_mount_safety() {
 check_space_safety() {
     target_path="$1"
     need_kb="$2"
-    target_abs=$(cd "$target_path" && pwd -P)
+    if [ -z "$target_path" ]; then
+        log_error "目标存储路径为空！"
+        exit 1
+    fi
+    target_abs=$(cd "$target_path" 2>/dev/null && pwd -P)
+    if [ -z "$target_abs" ]; then
+        log_error "无法解析目标存储绝对路径: $target_path"
+        exit 1
+    fi
     avail_kb=$(df -P "$target_abs" | awk 'NR==2{print $4}')
     if [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$need_kb" ]; then
         log_error "目标存储空间不足！可用: ${avail_kb:-0}KB，所需估算: ${need_kb}KB"
@@ -260,13 +272,14 @@ do_precheck() {
         fi
     fi
 
-    # 尝试定位 0:BOOTCONFIG 分区设备节点 (如 /dev/disk/by-partlabel/0:BOOTCONFIG 或 sysfs 识别的设备)
+    # 定位 0:BOOTCONFIG 分区设备节点 (通过 /dev/disk/by-partlabel/0:BOOTCONFIG 或 sysfs/fdisk 权威识别的设备)
     CFGPART="$(get_sys_path /dev/disk/by-partlabel/0:BOOTCONFIG)"
     if [ ! -e "$CFGPART" ] && [ -n "$BOOTCONF_DEV" ]; then
         CFGPART="$(get_sys_path "$BOOTCONF_DEV")"
     fi
-    if [ ! -e "$CFGPART" ] && [ -e "$(get_sys_path /dev/mmcblk0p2)" ]; then
-        CFGPART="$(get_sys_path /dev/mmcblk0p2)"
+    if [ ! -e "$CFGPART" ]; then
+        log_error "未找到权威 0:BOOTCONFIG 分区设备节点，严禁盲猜分区设备，待升级目标不明！"
+        exit 1
     fi
 
     PART_NUM=""
@@ -415,18 +428,15 @@ do_precheck() {
             case "$ACTUAL_ROOT_BYTES" in ''|*[!0-9]*) ACTUAL_ROOT_BYTES=0 ;; esac
         fi
 
-        if [ "$ACTUAL_KERN_BYTES" -gt 0 ]; then
-            ACTUAL_KERN_MB=$((ACTUAL_KERN_BYTES / 1024 / 1024))
-            log_info "从固件 tar 镜像中提取到实际内核大小: ${ACTUAL_KERN_BYTES} 字节 (${ACTUAL_KERN_MB}MB)"
-            if [ "$ACTUAL_KERN_BYTES" -gt "$TARGET_KERN_BYTES" ]; then
-                log_error "待升级内核大小 (${ACTUAL_KERN_BYTES} 字节) 超过目标内核分区 [$TARGET_KERN] 容量 (${TARGET_KERN_BYTES} 字节)！禁止刷入！"
-                exit 1
-            fi
-        else
-            if [ "$TARGET_KERN_MB" -lt 4 ]; then
-                log_error "待升级目标内核分区 [$TARGET_KERN] 容量仅为 ${TARGET_KERN_MB}MB，小于 4MB 安全阈值！禁止盲刷！"
-                exit 1
-            fi
+        if [ "$ACTUAL_KERN_BYTES" -le 0 ]; then
+            log_error "未能从固件镜像中解析到有效内核 (kernel) 大小，无法精准核验内核分区安全性！禁止盲刷！"
+            exit 1
+        fi
+        ACTUAL_KERN_MB=$((ACTUAL_KERN_BYTES / 1024 / 1024))
+        log_info "从固件 tar 镜像中提取到实际内核大小: ${ACTUAL_KERN_BYTES} 字节 (${ACTUAL_KERN_MB}MB)"
+        if [ "$ACTUAL_KERN_BYTES" -gt "$TARGET_KERN_BYTES" ]; then
+            log_error "待升级内核大小 (${ACTUAL_KERN_BYTES} 字节) 超过目标内核分区 [$TARGET_KERN] 容量 (${TARGET_KERN_BYTES} 字节)！禁止刷入！"
+            exit 1
         fi
 
         if [ "$ACTUAL_ROOT_BYTES" -gt 0 ]; then
@@ -788,10 +798,13 @@ do_backup() {
             fi
         fi
 
-        # 扫描外部 Bind Mounts (覆盖 HostConfig.Binds 与 HostConfig.Mounts)
+        # 扫描外部 Bind Mounts (使用 Docker 模板只导出真正 Type=bind 的挂载路径，严禁使用 grep 抓取整段 JSON 误判命名卷)
         : > "$META_DIR/bind_mounts_raw.txt"
-        grep -o '"Source": "[^"]*"' "$META_DIR/containers_inspect.json" 2>/dev/null | awk -F'"' '{print $4}' >> "$META_DIR/bind_mounts_raw.txt" || true
-        grep -o '"/[^"]*:[^"]*"' "$META_DIR/containers_inspect.json" 2>/dev/null | awk -F'"' '{print $2}' | awk -F':' '{print $1}' >> "$META_DIR/bind_mounts_raw.txt" || true
+        if [ -n "$C_IDS" ]; then
+            for cid in $C_IDS; do
+                docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{println}}{{end}}{{end}}' "$cid" 2>/dev/null >> "$META_DIR/bind_mounts_raw.txt" || true
+            done
+        fi
         sort -u "$META_DIR/bind_mounts_raw.txt" -o "$META_DIR/bind_mounts_raw.txt" || true
         while IFS= read -r mpath; do
             [ -z "$mpath" ] && continue
@@ -1445,7 +1458,16 @@ do_restore() {
             check_mount_safety "$dest_dir" "Compose 项目 [$proj_name] 目标目录 ($orig_dir)" 0
             proj_tar="$BACKUP_DIR/compose/${proj_name}.tar.gz"
             proj_uncomp_kb=$(get_uncompressed_kb "compose" "$proj_name" "$proj_tar")
-            dest_abs=$(cd "$dest_dir" 2>/dev/null || (mkdir -p "$dest_dir" && cd "$dest_dir" && pwd -P))
+            if [ -d "$dest_dir" ]; then
+                dest_abs=$(cd "$dest_dir" && pwd -P)
+            else
+                mkdir -p "$dest_dir"
+                dest_abs=$(cd "$dest_dir" && pwd -P)
+            fi
+            if [ -z "$dest_abs" ]; then
+                log_error "无法解析 Compose 项目 [$proj_name] 目标绝对路径: $dest_dir"
+                exit 1
+            fi
             df_proj=$(df -P "$dest_abs" 2>/dev/null || true)
             p_pt=$(echo "$df_proj" | awk 'NR==2{print $6}')
             p_dev=$(echo "$df_proj" | awk 'NR==2{print $1}')

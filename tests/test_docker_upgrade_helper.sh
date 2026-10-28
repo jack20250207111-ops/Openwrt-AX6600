@@ -92,6 +92,51 @@ case "$cmd" in
                 *"HostConfig.Mounts"*)
                     cat "$MOCK_STATE/cmounts_$cid" 2>/dev/null || true
                     ;;
+                *".Mounts"*|*"Mounts"*)
+                    if [ -f "$MOCK_STATE/mounts_$cid" ]; then
+                        cat "$MOCK_STATE/mounts_$cid"
+                    elif [ -f "$MOCK_STATE/cmounts_$cid" ]; then
+                        awk -F'|' '$1 == "bind" && $2 != "" {print $2}' "$MOCK_STATE/cmounts_$cid" 2>/dev/null || true
+                    elif [ -f "$MOCK_STATE/binds_$cid" ]; then
+                        awk -F':' '{if ($1 != "") print $1}' "$MOCK_STATE/binds_$cid" 2>/dev/null || true
+                    elif [ -f "$MOCK_STATE/inspect.json" ]; then
+                        awk -v target_id="$cid" '
+                            BEGIN { in_target = 0; in_binds = 0; in_mounts = 0; m_type = ""; m_src = "" }
+                            /"Id":/ || /"Name":/ {
+                                if (index($0, "\"" target_id "\"") > 0 || index($0, "\"/" target_id "\"") > 0) {
+                                    in_target = 1
+                                } else {
+                                    in_target = 0
+                                }
+                            }
+                            in_target && /"Binds"[[:space:]]*:/ { in_binds = 1 }
+                            in_target && in_binds {
+                                n = split($0, items, "\"")
+                                for (i = 1; i <= n; i++) {
+                                    if (items[i] ~ /^(\/|[a-zA-Z]:).*:(\/|[a-zA-Z]:)/) {
+                                        split(items[i], p, ":")
+                                        if (p[1] != "") print p[1]
+                                    }
+                                }
+                                if ($0 ~ /\]/) in_binds = 0
+                            }
+                            in_target && /"Mounts":/ { in_mounts = 1; next }
+                            in_target && in_mounts {
+                                if ($0 ~ /"Type":[[:space:]]*"bind"/) m_type = "bind"
+                                if ($0 ~ /"Source":[[:space:]]*"[^"]+"/) {
+                                    match($0, /"Source":[[:space:]]*"[^"]+"/)
+                                    split(substr($0, RSTART, RLENGTH), arr, "\"")
+                                    m_src = arr[4]
+                                }
+                                if ($0 ~ /\}/) {
+                                    if (m_type == "bind" && m_src != "") print m_src
+                                    m_type = ""; m_src = ""
+                                }
+                                if ($0 ~ /\]/) in_mounts = 0
+                            }
+                        ' "$MOCK_STATE/inspect.json" 2>/dev/null || true
+                    fi
+                    ;;
                 *"Labels"*"com.docker.compose.project.working_dir"*)
                     cat "$MOCK_STATE/comp_workdir_$cid" 2>/dev/null || true
                     ;;
@@ -302,9 +347,20 @@ cat << 'EOF' > "$MOCK_BIN/df"
 #!/bin/sh
 echo "df $*" >> "$MOCK_STATE/invocations.log"
 target=""
+has_target=0
 for arg; do
-    target="$arg"
+    case "$arg" in
+        -*) ;;
+        *)
+            target="$arg"
+            has_target=1
+            ;;
+    esac
 done
+if [ "$has_target" -eq 0 ] || [ -z "$target" ]; then
+    echo "df: missing operand or empty path" >&2
+    exit 1
+fi
 if [ -f "$MOCK_STATE/df_overlay_all" ] || [ -f "$MOCK_STATE/unmounted_$target" ] || echo "$target" | grep -q "unmounted"; then
     echo "Filesystem     1024-blocks   Used Available Capacity Mounted on"
     echo "overlayfs:/overlay 1048576 524288    524288      50% /"
@@ -366,7 +422,9 @@ case "$mode" in
         ;;
     missing_partitions)
         echo "Disk /dev/mmcblk0: 58.2 GiB"
-        echo "/dev/mmcblk0p1          2048        4095        2048   boot"
+        echo "/dev/mmcblk0p2          2048        2559         512   0:BOOTCONFIG"
+        echo "/dev/mmcblk0p13         2560       35327       32768   0:HLOS"
+        echo "/dev/mmcblk0p15        68096     1116671     1048576   rootfs"
         ;;
     *)
         echo "Disk /dev/mmcblk0: 58.2 GiB"
@@ -1170,11 +1228,22 @@ echo "PASS: 测试 7 通过（端到端隔离全量备份、数据库热备、�
 # -----------------------------------------------------------------------------
 echo "--- 测试 8: 镜像校验与双分区容量安全预检 ---"
 (
+    FW_DIR="$TEST_SANDBOX/fw_build_8"
+    mkdir -p "$FW_DIR/sysupgrade-glinet_gl-ax6600"
+    head -c 8388608 /dev/zero > "$FW_DIR/sysupgrade-glinet_gl-ax6600/kernel"
+    head -c 94371840 /dev/zero > "$FW_DIR/sysupgrade-glinet_gl-ax6600/root"
     IMG_FILE="$TEST_SANDBOX/test_fw.bin"
-    head -c 104857600 /dev/zero > "$IMG_FILE"
+    (cd "$FW_DIR" && tar -cf "$IMG_FILE" sysupgrade-glinet_gl-ax6600)
+    rm -rf "$FW_DIR"
     SHA_EXPECTED=$(sha256sum "$IMG_FILE" | awk '{print $1}')
 
-    # 8a: SHA256 不匹配时必须被拦截
+    # 准备基础 0:BOOTCONFIG 设备节点，使得预检通过分区定位进入镜像 SHA256 检查
+    mkdir -p "$SYS_ROOT/dev"
+    head -c 148 /dev/zero > "$SYS_ROOT/dev/mmcblk0p2"
+    printf '\x01' >> "$SYS_ROOT/dev/mmcblk0p2"
+    head -c 363 /dev/zero >> "$SYS_ROOT/dev/mmcblk0p2"
+
+    # 8a: SHA256 不匹配时必须被拦截，并严格断言报错信息
     set +e
     sh "$HELPER_SCRIPT" precheck "$IMG_FILE" "0000000000000000000000000000000000000000000000000000000000000000" --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t8_sha.log"
     ret=$?
@@ -1183,10 +1252,13 @@ echo "--- 测试 8: 镜像校验与双分区容量安全预检 ---"
         echo "FAIL: SHA256 错误未被拦截！"
         exit 1
     fi
+    if ! grep -qi "SHA256 校验不匹配" "$TEST_SANDBOX/t8_sha.log"; then
+        echo "FAIL: 未能正确断言因 SHA256 不匹配被拦截: $(cat "$TEST_SANDBOX/t8_sha.log")"
+        exit 1
+    fi
 
     # 8b: 0:BOOTCONFIG 偏移 148 为 0 时，目标分区为 0:HLOS 与 rootfs (60MB 较小分区)，绝不能被 512MB 误放行
     echo "dual_small_target" > "$MOCK_STATE/fdisk_mode"
-    mkdir -p "$SYS_ROOT/dev"
     head -c 148 /dev/zero > "$SYS_ROOT/dev/mmcblk0p2"
     printf '\x00' >> "$SYS_ROOT/dev/mmcblk0p2"
     head -c 363 /dev/zero >> "$SYS_ROOT/dev/mmcblk0p2"
@@ -1197,10 +1269,10 @@ echo "--- 测试 8: 镜像校验与双分区容量安全预检 ---"
     set -e
 
     if [ "$ret" -eq 0 ]; then
-        echo "FAIL: 目标分区仅 60MB，刷入 100MB 固件竟然被误放行！"
+        echo "FAIL: 目标分区仅 60MB，刷入 90MB 固件竟然被误放行！"
         exit 1
     fi
-    if ! grep -qiE "(目标分区容量.*不足|容量仅为.*小于 200MB 安全阈值)" "$TEST_SANDBOX/t8_part.log"; then
+    if ! grep -qiE "(目标分区容量.*不足|超过目标根文件系统分区)" "$TEST_SANDBOX/t8_part.log"; then
         echo "FAIL: 错误提示不符合预期: $(cat "$TEST_SANDBOX/t8_part.log")"
         exit 1
     fi
@@ -1225,7 +1297,29 @@ echo "--- 测试 8: 镜像校验与双分区容量安全预检 ---"
         exit 1
     fi
 
-    # 8e: 目标内核分区容量不足 4MB 严格拦截 (small_kernel_target 模式下 0:HLOS 仅 2MB)
+    # 8d: 固件未能提取到实际有效内核长度时必须严格拒绝盲刷，严禁退回 4MiB 猜测
+    NO_KERN_FW="$TEST_SANDBOX/no_kern_fw.bin"
+    head -c 10485760 /dev/zero > "$NO_KERN_FW"
+    NO_KERN_SHA=$(sha256sum "$NO_KERN_FW" | awk '{print $1}')
+    mkdir -p "$SYS_ROOT/dev"
+    head -c 148 /dev/zero > "$SYS_ROOT/dev/mmcblk0p2"
+    printf '\x01' >> "$SYS_ROOT/dev/mmcblk0p2"
+    head -c 363 /dev/zero >> "$SYS_ROOT/dev/mmcblk0p2"
+    set +e
+    sh "$HELPER_SCRIPT" precheck "$NO_KERN_FW" "$NO_KERN_SHA" --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t8_no_kern.log"
+    ret=$?
+    set -e
+    rm -f "$NO_KERN_FW" "$SYS_ROOT/dev/mmcblk0p2"
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 固件未包含有效内核信息竟然放行！"
+        exit 1
+    fi
+    if ! grep -qi "未能从固件镜像中解析到有效内核" "$TEST_SANDBOX/t8_no_kern.log"; then
+        echo "FAIL: 未能报告无法解析内核大小错误: $(cat "$TEST_SANDBOX/t8_no_kern.log")"
+        exit 1
+    fi
+
+    # 8e: 目标内核分区容量不足以容纳固件内核时严格拦截 (small_kernel_target 模式下 0:HLOS 仅 2MB，固件内核为 8MB)
     echo "small_kernel_target" > "$MOCK_STATE/fdisk_mode"
     head -c 148 /dev/zero > "$SYS_ROOT/dev/mmcblk0p2"
     printf '\x00' >> "$SYS_ROOT/dev/mmcblk0p2"
@@ -1238,10 +1332,10 @@ echo "--- 测试 8: 镜像校验与双分区容量安全预检 ---"
     rm -f "$MOCK_STATE/fdisk_mode" "$SYS_ROOT/dev/mmcblk0p2"
 
     if [ "$ret" -eq 0 ]; then
-        echo "FAIL: 目标内核分区仅 2MB (< 4MB)，预检竟然放行！"
+        echo "FAIL: 待升级内核 (8MB) 超过目标内核分区 (2MB)，预检竟然放行！"
         exit 1
     fi
-    if ! grep -qiE "(待升级目标内核分区.*小于 4MB 安全阈值|容量仅为 2MB)" "$TEST_SANDBOX/t8_kern.log"; then
+    if ! grep -qiE "(待升级内核大小.*超过目标内核分区|超过目标内核分区)" "$TEST_SANDBOX/t8_kern.log"; then
         echo "FAIL: 内核分区过小拦截报错信息异常: $(cat "$TEST_SANDBOX/t8_kern.log")"
         exit 1
     fi
@@ -2018,8 +2112,13 @@ echo "PASS: 测试 18 通过（HostConfig.Mounts 与多段 Entrypoint/Cmd 组合
 # -----------------------------------------------------------------------------
 echo "--- 测试 19: 分区预检 sysfs 权威判定与反例测试 ---"
 (
+    FW_DIR19="$TEST_SANDBOX/fw_build_19"
+    mkdir -p "$FW_DIR19/sysupgrade-glinet_gl-ax6600"
+    head -c 4194304 /dev/zero > "$FW_DIR19/sysupgrade-glinet_gl-ax6600/kernel"
+    head -c 52428800 /dev/zero > "$FW_DIR19/sysupgrade-glinet_gl-ax6600/root"
     IMG_FILE="$TEST_SANDBOX/test_fw19.bin"
-    head -c 10485760 /dev/zero > "$IMG_FILE"
+    (cd "$FW_DIR19" && tar -cf "$IMG_FILE" sysupgrade-glinet_gl-ax6600)
+    rm -rf "$FW_DIR19"
     SHA_EXPECTED=$(sha256sum "$IMG_FILE" | awk '{print $1}')
 
     # 19a: 0:BOOTCONFIG 分区不可读/损坏时，严禁盲猜，必须严格报错退出
@@ -2032,7 +2131,7 @@ echo "--- 测试 19: 分区预检 sysfs 权威判定与反例测试 ---"
         echo "FAIL: 0:BOOTCONFIG 不可读时预检竟然放行！"
         exit 1
     fi
-    if ! grep -q "无法从 0:BOOTCONFIG 分区读取启动配置标记" "$TEST_SANDBOX/t19_bootconf_fail.log"; then
+    if ! grep -qiE "(未找到权威 0:BOOTCONFIG 分区设备节点|无法从 0:BOOTCONFIG 分区读取启动配置标记)" "$TEST_SANDBOX/t19_bootconf_fail.log"; then
         echo "FAIL: 0:BOOTCONFIG 缺失报错不符合预期: $(cat "$TEST_SANDBOX/t19_bootconf_fail.log")"
         exit 1
     fi
@@ -2208,17 +2307,134 @@ EOF
     touch "$MOCK_STATE/pgrep_running_sing-box"
     echo "8888" > "$MOCK_STATE/pgrep_pid_sing-box"
 
-    # 执行 PassWall2 验证
-    PW_OUT=$(sh "$HELPER_SCRIPT" verify passwall --sys-root "$SYS_ROOT" 2>&1 || true)
-    rm -rf "$SYS_ROOT/var/etc/passwall2" "$SYS_ROOT/proc/8888" "$MOCK_STATE/pgrep_running_sing-box" "$MOCK_STATE/pgrep_pid_sing-box"
-
-    # 验证是否成功从 ACL 子目录中提取出 2080 端口发起请求
+    # 21a: 正常 PassWall2 验证必须返回 0，严禁吞掉退出码
+    set +e
+    PW_OUT=$(sh "$HELPER_SCRIPT" verify passwall --sys-root "$SYS_ROOT" 2>&1)
+    ret=$?
+    set -e
+    if [ "$ret" -ne 0 ]; then
+        echo "FAIL: PassWall2 正常配置验证未能成功通过 (退出码 $ret): $PW_OUT"
+        exit 1
+    fi
     if ! echo "$PW_OUT" | grep -q "2080"; then
         echo "FAIL: 未能成功从 ACL 深度子目录配置文件中定位到 SOCKS 本地端口 2080: $PW_OUT"
         exit 1
     fi
-)
-echo "PASS: 测试 21 通过（PassWall2 动态反查进程 cmdline 且递归识别 ACL 深层子目录配置）"
+    if ! echo "$PW_OUT" | grep -q "PassWall2 代理握手验证成功"; then
+        echo "FAIL: PassWall2 代理握手验证未成功记录: $PW_OUT"
+        exit 1
+    fi
 
-echo "=== 全部 21 项深度隔离测试与回归演练已通过！ ==="
+    # 21b: TLS 握手失败时必须严格返回非 0 退出码并拦截，严禁误判通过
+    touch "$MOCK_STATE/curl_fail"
+    set +e
+    PW_FAIL_OUT=$(sh "$HELPER_SCRIPT" verify passwall --sys-root "$SYS_ROOT" 2>&1)
+    ret_fail=$?
+    set -e
+    rm -f "$MOCK_STATE/curl_fail"
+    rm -rf "$SYS_ROOT/var/etc/passwall2" "$SYS_ROOT/proc/8888" "$MOCK_STATE/pgrep_running_sing-box" "$MOCK_STATE/pgrep_pid_sing-box"
+
+    if [ "$ret_fail" -eq 0 ]; then
+        echo "FAIL: TLS 请求失败时 verify passwall 竟然返回成功 (退出码 0): $PW_FAIL_OUT"
+        exit 1
+    fi
+    if ! echo "$PW_FAIL_OUT" | grep -q "PassWall2 代理握手失败"; then
+        echo "FAIL: TLS 失败时未报告预期错误: $PW_FAIL_OUT"
+        exit 1
+    fi
+)
+echo "PASS: 测试 21 通过（PassWall2 动态反查进程 cmdline、递归识别 ACL 子目录且严格断言退出码与 TLS 连通性）"
+
+# -----------------------------------------------------------------------------
+# 测试 22: 容器挂载命名卷（Type=volume）严禁被误判为宿主 Bind 路径导致备份阻断
+# -----------------------------------------------------------------------------
+echo "--- 测试 22: 命名卷与外部 Bind 挂载严格区分（杜绝误判） ---"
+(
+    T22_DOCKER="$TEST_SANDBOX/t22_docker"
+    T22_TARGET="$TEST_SANDBOX/t22_target"
+    mkdir -p "$T22_DOCKER/volumes" "$T22_TARGET"
+    echo "$T22_DOCKER" > "$MOCK_STATE/docker_root_dir"
+
+    echo "c22_vol_cid" > "$MOCK_STATE/containers_list_ids"
+    echo "c22_app" > "$MOCK_STATE/cname_c22_vol_cid"
+    echo "alpine:latest" > "$MOCK_STATE/cimg_c22_vol_cid"
+
+    # 设置容器挂载：包含一个真正的命名卷 appdata（Source 为 appdata，Type 为 volume，在宿主不存在同名路径）
+    # 同时包含一个合法的宿主 Bind 路径
+    T22_HOST_PATH="/t22_real_host_dir"
+    mkdir -p "$SYS_ROOT$T22_HOST_PATH"
+    echo "real_host_payload" > "$SYS_ROOT$T22_HOST_PATH/file.txt"
+
+    # 配置 HostConfig.Mounts: volume(appdata) 和 bind(/t22_real_host_dir)
+    printf 'volume|appdata|/var/appdata|false\nbind|%s|/data|false\n' "$T22_HOST_PATH" > "$MOCK_STATE/cmounts_c22_vol_cid"
+
+    # 执行备份，必须成功，绝不能因不存在路径 appdata 报错
+    set +e
+    sh "$HELPER_SCRIPT" backup \
+        --docker-dir "$T22_DOCKER" \
+        --target-dir "$T22_TARGET" \
+        --sys-root "$SYS_ROOT" \
+        --skip-stop >"$TEST_SANDBOX/t22.log" 2>&1
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/containers_list_ids" "$MOCK_STATE/cmounts_c22_vol_cid"
+
+    if [ "$ret" -ne 0 ]; then
+        echo "FAIL: 包含命名卷的容器备份失败 (退出码 $ret): $(cat "$TEST_SANDBOX/t22.log")"
+        exit 1
+    fi
+    if grep -q "appdata" "$T22_TARGET/metadata/bind_mounts.txt" 2>/dev/null; then
+        echo "FAIL: 命名卷 appdata 被错误写入了 bind_mounts.txt！"
+        exit 1
+    fi
+    if ! grep -q "$T22_HOST_PATH" "$T22_TARGET/metadata/bind_mounts.txt" 2>/dev/null; then
+        echo "FAIL: 真正的 bind 挂载路径 $T22_HOST_PATH 未被写入 bind_mounts.txt！"
+        exit 1
+    fi
+)
+echo "PASS: 测试 22 通过（命名卷准确与 Bind 区分，杜绝将 Volume Name 误当宿主路径）"
+
+# -----------------------------------------------------------------------------
+# 测试 23: Compose 原目录已存在时，恢复能够正确获取目标路径并顺利通过空间预检
+# -----------------------------------------------------------------------------
+echo "--- 测试 23: Compose 原目录已存在时的恢复路径检查 ---"
+(
+    T23_BKP="$TEST_SANDBOX/t23_bkp"
+    T23_DATA="$TEST_SANDBOX/t23_dst_docker"
+    T23_COMP="/t23_my_existing_compose"
+    T23_COMP_HOST="$SYS_ROOT$T23_COMP"
+
+    # 预先创建该目标目录，模拟升级时原 Compose 目录已存在的情况
+    mkdir -p "$T23_COMP_HOST" "$T23_DATA" "$T23_BKP/metadata" "$T23_BKP/config/etc_docker" "$T23_BKP/compose"
+
+    touch "$T23_BKP/config/config_dockerd" "$T23_BKP/config/config_dockerman" "$T23_BKP/config/etc_docker/daemon.json"
+    tar -czf "$T23_BKP/docker_volumes.tar.gz" -T /dev/null 2>/dev/null || touch "$T23_BKP/docker_volumes.tar.gz"
+    tar -czf "$T23_BKP/compose/p23.tar.gz" -T /dev/null 2>/dev/null || touch "$T23_BKP/compose/p23.tar.gz"
+    tar -czf "$T23_BKP/docker_bind_mounts.tar.gz" -T /dev/null 2>/dev/null || touch "$T23_BKP/docker_bind_mounts.tar.gz"
+
+    echo "p23	$T23_COMP	$T23_COMP/docker-compose.yml" > "$T23_BKP/metadata/compose_manifest.tsv"
+    : > "$T23_BKP/metadata/bind_mounts.txt"
+
+    (
+        cd "$T23_BKP"
+        echo "manifest" > backup_manifest.txt
+        find . -type f ! -name "sha256sums.txt" | sed 's|^\./||' | xargs sha256sum > sha256sums.txt
+    )
+
+    set +e
+    sh "$HELPER_SCRIPT" restore \
+        --backup-dir "$T23_BKP" \
+        --target-data-root "$T23_DATA" \
+        --sys-root "$SYS_ROOT" >"$TEST_SANDBOX/t23.log" 2>&1
+    ret=$?
+    set -e
+
+    if [ "$ret" -ne 0 ]; then
+        echo "FAIL: Compose 目标目录已存在时恢复失败 (退出码 $ret): $(cat "$TEST_SANDBOX/t23.log")"
+        exit 1
+    fi
+)
+echo "PASS: 测试 23 通过（Compose 目标目录已存在时恢复能够正确获取目标绝对路径且通过空间预检）"
+
+echo "=== 全部 23 项深度隔离测试与回归演练已通过！ ==="
 

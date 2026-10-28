@@ -24,8 +24,9 @@ cat /tmp/sysinfo/model 2>/dev/null || cat /proc/device-tree/model 2>/dev/null
 - **严格判定原则**：若 `0:BOOTCONFIG` 缺失或读取失败，辅助工具及升级流程将**立即严格报错退出**，绝不盲猜分区、绝不在双分区中误取较小分区；若待写入的目标对侧分区（如 `0:HLOS_1` 或 `rootfs_1`）不存在，严禁向同名或非目标分区借用扇区容量，必须即刻阻断。
 
 ```bash
-# 1. 查看 BOOTCONFIG 分区偏移 148 字节标记（确定主备切换目标）
-hexdump -e '1/1 "%01x|"' -n 1 -s 148 -C /dev/disk/by-partlabel/0:BOOTCONFIG 2>/dev/null || od -An -tx1 -N 1 -j 148 /dev/mmcblk0p2
+# 1. 查看 BOOTCONFIG 分区偏移 148 字节标记（确定主备切换目标，严格基于 partlabel 或 sysfs 权威节点）
+CFG_DEV=$(readlink -f /dev/disk/by-partlabel/0:BOOTCONFIG 2>/dev/null || grep -l "PARTNAME=0:BOOTCONFIG" /sys/class/block/mmcblk0p*/uevent 2>/dev/null | sed 's|/uevent||' | sed 's|.*/|/dev/|')
+[ -e "$CFG_DEV" ] && (hexdump -e '1/1 "%01x|"' -n 1 -s 148 -C "$CFG_DEV" 2>/dev/null || od -An -tx1 -N 1 -j 148 "$CFG_DEV")
 
 # 2. 查看 eMMC 分区表及实际分区名称与扇区容量
 # 注：util-linux 标准 fdisk -l 在 GPT 下不输出 Name 列，系统内核 sysfs 是最权威的数据源：
@@ -77,8 +78,8 @@ mount | grep -E " / | /overlay "
 # 列出全部 Named Volumes
 docker volume ls
 
-# 列出所有容器的宿主机绑定挂载路径 (Bind Mounts)
-docker inspect --format '{{.Name}}: {{range .Mounts}}{{if eq .Type "bind"}}{{.Source}} -> {{.Destination}} {{end}}{{end}}' $(docker ps -aq) 2>/dev/null
+# 列出所有容器的宿主机绑定挂载路径 (Bind Mounts，通过 Type=bind 严格过滤命名卷)
+docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{println}}{{end}}{{end}}' $(docker ps -aq) 2>/dev/null | sort -u
 ```
 
 ### 5. 唯一固件文件校验与机型兼容性预检
