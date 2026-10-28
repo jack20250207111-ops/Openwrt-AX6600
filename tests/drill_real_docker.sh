@@ -47,38 +47,21 @@ fi
 # 2. 宿主安全防护：严禁在共享业务 Docker 宿主直接运行 helper 停机备份
 if [ "$ISOLATED_MODE" -eq 0 ]; then
     RUNNING_CONTAINERS=$(docker ps -q 2>/dev/null || true)
-    if [ -n "$RUNNING_CONTAINERS" ] && [ "$ALLOW_HOST" -eq 0 ]; then
-        log "检测到当前宿主机存在运行中的业务容器 ($(echo "$RUNNING_CONTAINERS" | wc -w) 个)。"
-        log "为防止 helper 停机冷备中断宿主机其他业务容器，自动启动专用隔离 DinD (Docker-in-Docker) 容器执行演练..."
+    if [ "$ALLOW_HOST" -eq 0 ]; then
+        if [ -n "$RUNNING_CONTAINERS" ]; then
+            log "检测到当前宿主机存在运行中的业务容器 ($(echo "$RUNNING_CONTAINERS" | wc -w) 个)。"
+            log "为防止 helper 停机冷备中断宿主机其他业务容器，自动启动专用隔离 DinD (Docker-in-Docker) 容器执行演练..."
+        else
+            log "提示: 当前机器未指定 --allow-host，为保护宿主环境，自动启动专用隔离 DinD (Docker-in-Docker) 容器执行演练..."
+        fi
         exec docker run --rm --privileged \
             -e AX6600_DRILL_ISOLATED=1 \
             -v "$REPO_ROOT:/workspace" \
             -w /workspace \
             docker:dind sh -c '
-                dockerd-entrypoint.sh dockerd >/dev/null 2>&1 &
-                n=0
-                while [ $n -lt 30 ]; do
-                    if docker info >/dev/null 2>&1; then
-                        break
-                    fi
-                    n=$((n + 1))
-                    sleep 1
-                done
-                if [ $n -ge 30 ]; then
-                    echo "[DRILL ERROR] DinD 内部 dockerd 启动超时！" >&2
-                    exit 1
+                if command -v apk >/dev/null 2>&1; then
+                    apk add --no-cache e2fsprogs >/dev/null 2>&1 || true
                 fi
-                /workspace/tests/drill_real_docker.sh --isolated
-            '
-    fi
-    if [ "$ALLOW_HOST" -eq 0 ] && [ -z "$RUNNING_CONTAINERS" ]; then
-        log "提示: 当前无运行容器，如需直接在当前机器运行请指定 --allow-host 或 --isolated。"
-        log "正在通过隔离容器执行演练..."
-        exec docker run --rm --privileged \
-            -e AX6600_DRILL_ISOLATED=1 \
-            -v "$REPO_ROOT:/workspace" \
-            -w /workspace \
-            docker:dind sh -c '
                 dockerd-entrypoint.sh dockerd >/dev/null 2>&1 &
                 n=0
                 while [ $n -lt 30 ]; do
@@ -114,18 +97,31 @@ cleanup_drill_storage() {
 
 if [ -n "${DRILL_STORAGE_ROOT:-}" ] && [ -d "$DRILL_STORAGE_ROOT" ]; then
     DRILL_ROOT="$DRILL_STORAGE_ROOT/ax6600_drill_$$"
-elif [ "$(id -u)" = "0" ] && command -v mount >/dev/null 2>&1 && command -v truncate >/dev/null 2>&1 && command -v mkfs.ext4 >/dev/null 2>&1; then
+elif [ "$(id -u)" = "0" ] && command -v mount >/dev/null 2>&1 && command -v truncate >/dev/null 2>&1 && (command -v mkfs.ext4 >/dev/null 2>&1 || command -v mkfs.ext2 >/dev/null 2>&1 || command -v mke2fs >/dev/null 2>&1); then
     # 使用 loopback ext4 独立挂载，既不污染宿主，又完美满足非 rootfs / 非 tmpfs 外部存储安全核验
     DRILL_LOOP_DEV="/var/run/ax6600_drill_loop_$$.img"
     DRILL_LOOP_MNT="/mnt/ax6600_drill_$$"
     mkdir -p /var/run "$DRILL_LOOP_MNT"
     truncate -s 256M "$DRILL_LOOP_DEV"
-    mkfs.ext4 -F "$DRILL_LOOP_DEV" >/dev/null 2>&1
+    if command -v mkfs.ext4 >/dev/null 2>&1; then
+        mkfs.ext4 -F "$DRILL_LOOP_DEV" >/dev/null 2>&1
+    elif command -v mkfs.ext2 >/dev/null 2>&1; then
+        mkfs.ext2 -F "$DRILL_LOOP_DEV" >/dev/null 2>&1
+    else
+        mke2fs -F "$DRILL_LOOP_DEV" >/dev/null 2>&1
+    fi
     mount -o loop "$DRILL_LOOP_DEV" "$DRILL_LOOP_MNT"
     DRILL_ROOT="$DRILL_LOOP_MNT/drill_root"
 else
-    # 备用方案：在非 /tmp 的 /var 目录组织测试目录
-    DRILL_ROOT="/var/ax6600_drill_$$"
+    # 查找是否有其他非 rootfs / 非 tmpfs 挂载点
+    external_cand=$(df -P 2>/dev/null | awk '$6 ~ /^\/(mnt|media|opt|data)/ && $1 !~ /(overlay|rootfs|tmpfs|ramfs|shm)/ {print $6}' | head -n 1 || true)
+    if [ -n "$external_cand" ] && [ -d "$external_cand" ]; then
+        DRILL_ROOT="$external_cand/ax6600_drill_$$"
+    else
+        log_err "无法创建隔离 ext4 loop 挂载点，且未找到合规的独立外部挂载介质。"
+        log_err "请以 root 身份运行以允许 loop 挂载，或通过环境变量 DRILL_STORAGE_ROOT 指定非 rootfs/tmpfs 挂载目录！"
+        exit 1
+    fi
 fi
 
 DRILL_BACKUP="$DRILL_ROOT/backup_target"
@@ -134,26 +130,69 @@ DRILL_BIND_SRC="$DRILL_ROOT/host_bind_data"
 DRILL_COMPOSE_DIR="$DRILL_ROOT/compose_proj"
 DRILL_SYS_ROOT="$DRILL_ROOT/mock_sys_root"
 DRILL_BIN="$DRILL_ROOT/bin"
+export DRILL_SYS_ROOT
 
 mkdir -p "$DRILL_BACKUP" "$DRILL_RESTORE_DATA" "$DRILL_BIND_SRC" "$DRILL_COMPOSE_DIR" "$DRILL_SYS_ROOT" "$DRILL_BIN"
 
 # 4. 初始化模拟 OpenWrt 服务脚本与工具（解决普通 Linux 缺失 /etc/init.d/dockerd 与 uci 的问题）
-cat << 'EOF' > "$DRILL_SYS_ROOT/etc_init_dockerd"
+cat << EOF > "$DRILL_SYS_ROOT/etc_init_dockerd"
 #!/bin/sh
-cmd="$1"
-case "$cmd" in
+cmd="\$1"
+STATE_FILE="$DRILL_SYS_ROOT/dockerd_enabled"
+CONFIG_FILE="$DRILL_SYS_ROOT/etc/config/dockerd.data_root"
+case "\$cmd" in
     enabled)
-        [ "$(cat "$DRILL_SYS_ROOT/dockerd_enabled" 2>/dev/null || echo 0)" = "1" ] && exit 0 || exit 1
+        [ "\$(cat "\$STATE_FILE" 2>/dev/null || echo 0)" = "1" ] && exit 0 || exit 1
         ;;
     enable)
-        echo "1" > "$DRILL_SYS_ROOT/dockerd_enabled"
+        echo "1" > "\$STATE_FILE"
         exit 0
         ;;
     disable)
-        echo "0" > "$DRILL_SYS_ROOT/dockerd_enabled"
+        echo "0" > "\$STATE_FILE"
         exit 0
         ;;
-    start|stop|restart)
+    stop)
+        pid=\$(pgrep -x dockerd 2>/dev/null || true)
+        if [ -n "\$pid" ]; then
+            kill -TERM \$pid 2>/dev/null || true
+            n=0
+            while [ \$n -lt 30 ]; do
+                if ! pgrep -x dockerd >/dev/null 2>&1; then
+                    break
+                fi
+                n=\$((n + 1))
+                sleep 1
+            done
+            if pgrep -x dockerd >/dev/null 2>&1; then
+                kill -9 \$pid 2>/dev/null || true
+                sleep 1
+            fi
+        fi
+        exit 0
+        ;;
+    start|restart)
+        if ! pgrep -x dockerd >/dev/null 2>&1; then
+            dr=""
+            if [ -f "\$CONFIG_FILE" ]; then
+                dr=\$(cat "\$CONFIG_FILE" 2>/dev/null || echo "")
+            fi
+            dr_flag=""
+            [ -n "\$dr" ] && dr_flag="--data-root \$dr"
+            if command -v dockerd-entrypoint.sh >/dev/null 2>&1; then
+                dockerd-entrypoint.sh dockerd \$dr_flag >/dev/null 2>&1 &
+            elif command -v dockerd >/dev/null 2>&1; then
+                dockerd \$dr_flag >/dev/null 2>&1 &
+            fi
+            n=0
+            while [ \$n -lt 30 ]; do
+                if docker info >/dev/null 2>&1; then
+                    break
+                fi
+                n=\$((n + 1))
+                sleep 1
+            done
+        fi
         exit 0
         ;;
     *)
@@ -166,16 +205,17 @@ cp "$DRILL_SYS_ROOT/etc_init_dockerd" "$DRILL_SYS_ROOT/etc/init.d/dockerd"
 chmod +x "$DRILL_SYS_ROOT/etc/init.d/dockerd"
 echo "1" > "$DRILL_SYS_ROOT/dockerd_enabled"
 
-cat << 'EOF' > "$DRILL_BIN/uci"
+cat << EOF > "$DRILL_BIN/uci"
 #!/bin/sh
-cmd="$1"
+cmd="\$1"
 shift || true
-case "$cmd" in
+CONFIG_FILE="$DRILL_SYS_ROOT/etc/config/dockerd.data_root"
+case "\$cmd" in
     get|-q)
-        [ "$cmd" = "-q" ] && { cmd="$1"; shift || true; }
-        case "${1:-}" in
+        [ "\$cmd" = "-q" ] && { cmd="\$1"; shift || true; }
+        case "\${1:-}" in
             dockerd.globals.data_root)
-                cat "$DRILL_SYS_ROOT/etc/config/dockerd.data_root" 2>/dev/null || echo ""
+                cat "\$CONFIG_FILE" 2>/dev/null || echo ""
                 exit 0
                 ;;
             *)
@@ -184,10 +224,11 @@ case "$cmd" in
         esac
         ;;
     set)
-        key=$(echo "${1:-}" | cut -d= -f1)
-        val=$(echo "${1:-}" | cut -d= -f2-)
-        if [ "$key" = "dockerd.globals.data_root" ]; then
-            echo "$val" > "$DRILL_SYS_ROOT/etc/config/dockerd.data_root"
+        key=\$(echo "\${1:-}" | cut -d= -f1)
+        val=\$(echo "\${1:-}" | cut -d= -f2-)
+        if [ "\$key" = "dockerd.globals.data_root" ]; then
+            mkdir -p "\$(dirname "\$CONFIG_FILE")"
+            echo "\$val" > "\$CONFIG_FILE"
         fi
         exit 0
         ;;

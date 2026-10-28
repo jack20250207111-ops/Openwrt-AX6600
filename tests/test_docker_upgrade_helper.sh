@@ -2433,8 +2433,25 @@ echo "--- 测试 23: Compose 原目录已存在时的恢复路径检查 ---"
         echo "FAIL: Compose 目标目录已存在时恢复失败 (退出码 $ret): $(cat "$TEST_SANDBOX/t23.log")"
         exit 1
     fi
+
+    # 23b: 恢复时若 target-data-root 为空，必须严格拦截并报错
+    set +e
+    sh "$HELPER_SCRIPT" restore \
+        --backup-dir "$T23_BKP" \
+        --target-data-root "" \
+        --sys-root "$SYS_ROOT" >"$TEST_SANDBOX/t23_empty_data.log" 2>&1
+    ret_empty=$?
+    set -e
+    if [ "$ret_empty" -eq 0 ]; then
+        echo "FAIL: target-data-root 为空时竟然未被拦截！"
+        exit 1
+    fi
+    if ! grep -qiE "(恢复必须同时指定.*target-data-root|目标 DataRoot 存储路径为空|路径为空)" "$TEST_SANDBOX/t23_empty_data.log"; then
+        echo "FAIL: 空路径报错不符合预期: $(cat "$TEST_SANDBOX/t23_empty_data.log")"
+        exit 1
+    fi
 )
-echo "PASS: 测试 23 通过（Compose 目标目录已存在时恢复能够正确获取目标绝对路径且通过空间预检）"
+echo "PASS: 测试 23 通过（Compose 目标目录已存在时恢复能够正确获取目标绝对路径，空目标路径被严格拦截）"
 
 echo "=== 全部 23 项深度隔离测试与回归演练已通过！ ==="
 

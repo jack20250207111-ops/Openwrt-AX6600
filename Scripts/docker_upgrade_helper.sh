@@ -807,6 +807,7 @@ do_backup() {
         fi
         sort -u "$META_DIR/bind_mounts_raw.txt" -o "$META_DIR/bind_mounts_raw.txt" || true
         while IFS= read -r mpath; do
+            mpath=$(echo "$mpath" | tr -d '\r')
             [ -z "$mpath" ] && continue
             case "$mpath" in
                 /proc*|/sys*|/dev*|/etc/resolv.conf|/etc/hosts|/etc/hostname|"$DOCKER_ABS"*)
@@ -1415,8 +1416,16 @@ do_restore() {
 
     # 2. 确认恢复端所有目标路径真实挂载在外部存储，记录各组件解压所需真实空间并按目标文件系统汇总核验
     log_info "正在预检全部恢复目标的挂载设备、安全与汇总可用空间..."
+    if [ -z "$TARGET_DATA_ROOT" ]; then
+        log_error "目标 DataRoot 存储路径为空！"
+        exit 1
+    fi
     mkdir -p "$TARGET_DATA_ROOT"
-    TARGET_DATA_ABS=$(cd "$TARGET_DATA_ROOT" && pwd -P)
+    TARGET_DATA_ABS=$(cd "$TARGET_DATA_ROOT" 2>/dev/null && pwd -P)
+    if [ -z "$TARGET_DATA_ABS" ]; then
+        log_error "无法解析目标 DataRoot 绝对路径: $TARGET_DATA_ROOT"
+        exit 1
+    fi
 
     UNCOMP_FILE="$BACKUP_DIR/metadata/uncompressed_sizes.tsv"
 
@@ -1489,7 +1498,11 @@ do_restore() {
                 [ "$p_d" = "$chk_d" ] && break
                 chk_d="$p_d"
             done
-            b_abs=$(cd "$chk_d" && pwd -P)
+            b_abs=$(cd "$chk_d" 2>/dev/null && pwd -P)
+            if [ -z "$b_abs" ]; then
+                log_error "无法解析 Bind Mount 恢复目标 [$mpath] 绝对路径: $actual_dest"
+                exit 1
+            fi
             df_b=$(df -P "$b_abs" 2>/dev/null || true)
             b_pt=$(echo "$df_b" | awk 'NR==2{print $6}')
             b_dev=$(echo "$df_b" | awk 'NR==2{print $1}')
