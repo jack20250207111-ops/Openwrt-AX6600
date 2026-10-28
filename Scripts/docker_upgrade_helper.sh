@@ -753,8 +753,11 @@ do_backup() {
                     fi
 
                     # 检查 HostConfig.Mounts（--mount）配置
-                    cmounts_raw=$(docker inspect -f '{{range .HostConfig.Mounts}}{{.Type}}|{{.Source}}|{{.Target}}|{{.ReadOnly}}
-{{end}}' "$cid" 2>/dev/null || true)
+                    if ! cmounts_raw=$(docker inspect -f '{{range .HostConfig.Mounts}}{{.Type}}|{{.Source}}|{{.Target}}|{{.ReadOnly}}
+{{end}}' "$cid" 2>/dev/null); then
+                        log_error "读取独立容器 $cname 的 Mount 配置失败！已在修改服务状态前阻断。"
+                        exit 1
+                    fi
                     if [ -n "$cmounts_raw" ]; then
                         echo "$cmounts_raw" | while IFS= read -r mline || [ -n "$mline" ]; do
                             [ -z "$mline" ] && continue
@@ -802,7 +805,10 @@ do_backup() {
         : > "$META_DIR/bind_mounts_raw.txt"
         if [ -n "$C_IDS" ]; then
             for cid in $C_IDS; do
-                docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{println}}{{end}}{{end}}' "$cid" 2>/dev/null >> "$META_DIR/bind_mounts_raw.txt" || true
+                if ! docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{println}}{{end}}{{end}}' "$cid" >> "$META_DIR/bind_mounts_raw.txt" 2>/dev/null; then
+                    log_error "读取容器 $cid 挂载清单失败，无法保证备份完整！已在修改服务状态前阻断。"
+                    exit 1
+                fi
             done
         fi
         sort -u "$META_DIR/bind_mounts_raw.txt" -o "$META_DIR/bind_mounts_raw.txt" || true

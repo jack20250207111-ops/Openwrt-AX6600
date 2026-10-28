@@ -22,11 +22,6 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 0
 fi
 
-if ! docker info >/dev/null 2>&1; then
-    log_err "Docker 守护进程未运行或无权限访问，跳过真实 Docker 演练。"
-    exit 0
-fi
-
 ISOLATED_MODE=0
 ALLOW_HOST=0
 for arg in "$@"; do
@@ -40,44 +35,33 @@ for arg in "$@"; do
     esac
 done
 
-if [ -f /.dockerenv ] || [ "${AX6600_DRILL_ISOLATED:-0}" = "1" ]; then
+if [ "${AX6600_DRILL_ISOLATED:-0}" = "1" ]; then
     ISOLATED_MODE=1
 fi
 
 # 2. 宿主安全防护：严禁在共享业务 Docker 宿主直接运行 helper 停机备份
-if [ "$ISOLATED_MODE" -eq 0 ]; then
-    RUNNING_CONTAINERS=$(docker ps -q 2>/dev/null || true)
-    if [ "$ALLOW_HOST" -eq 0 ]; then
-        if [ -n "$RUNNING_CONTAINERS" ]; then
-            log "检测到当前宿主机存在运行中的业务容器 ($(echo "$RUNNING_CONTAINERS" | wc -w) 个)。"
-            log "为防止 helper 停机冷备中断宿主机其他业务容器，自动启动专用隔离 DinD (Docker-in-Docker) 容器执行演练..."
-        else
-            log "提示: 当前机器未指定 --allow-host，为保护宿主环境，自动启动专用隔离 DinD (Docker-in-Docker) 容器执行演练..."
-        fi
-        exec docker run --rm --privileged \
-            -e AX6600_DRILL_ISOLATED=1 \
-            -v "$REPO_ROOT:/workspace" \
-            -w /workspace \
-            docker:dind sh -c '
-                if command -v apk >/dev/null 2>&1; then
-                    apk add --no-cache e2fsprogs >/dev/null 2>&1 || true
-                fi
-                dockerd-entrypoint.sh dockerd >/dev/null 2>&1 &
-                n=0
-                while [ $n -lt 30 ]; do
-                    if docker info >/dev/null 2>&1; then
-                        break
-                    fi
-                    n=$((n + 1))
-                    sleep 1
-                done
-                if [ $n -ge 30 ]; then
-                    echo "[DRILL ERROR] DinD 内部 dockerd 启动超时！" >&2
-                    exit 1
-                fi
-                /workspace/tests/drill_real_docker.sh --isolated
-            '
+if [ "$ISOLATED_MODE" -eq 0 ] && [ "$ALLOW_HOST" -eq 0 ]; then
+    if ! docker info >/dev/null 2>&1; then
+        log_err "Docker 守护进程未运行或无权限访问，跳过真实 Docker 演练。"
+        exit 0
     fi
+    RUNNING_CONTAINERS=$(docker ps -q 2>/dev/null || true)
+    if [ -n "$RUNNING_CONTAINERS" ]; then
+        log "检测到当前宿主机存在运行中的业务容器 ($(echo "$RUNNING_CONTAINERS" | wc -w) 个)。"
+        log "为防止 helper 停机冷备中断宿主机其他业务容器，自动启动专用隔离 DinD (Docker-in-Docker) 容器执行演练..."
+    else
+        log "提示: 当前机器未指定 --allow-host，为保护宿主环境，自动启动专用隔离 DinD (Docker-in-Docker) 容器执行演练..."
+    fi
+    exec docker run --rm --privileged \
+        -e AX6600_DRILL_ISOLATED=1 \
+        -v "$REPO_ROOT:/workspace" \
+        -w /workspace \
+        docker:dind sh -c '
+            if command -v apk >/dev/null 2>&1; then
+                apk add --no-cache e2fsprogs >/dev/null 2>&1 || true
+            fi
+            /workspace/tests/drill_real_docker.sh --isolated
+        '
 fi
 
 # 3. 准备隔离存储挂载点（绝不在 /tmp 下建立备份，防止被 check_mount_safety 拒绝）
@@ -126,13 +110,21 @@ fi
 
 DRILL_BACKUP="$DRILL_ROOT/backup_target"
 DRILL_RESTORE_DATA="$DRILL_ROOT/restored_dataroot"
-DRILL_BIND_SRC="$DRILL_ROOT/host_bind_data"
-DRILL_COMPOSE_DIR="$DRILL_ROOT/compose_proj"
 DRILL_SYS_ROOT="$DRILL_ROOT/mock_sys_root"
 DRILL_BIN="$DRILL_ROOT/bin"
+DRILL_SOCK="$DRILL_ROOT/dockerd.sock"
+DRILL_PID_FILE="$DRILL_ROOT/dockerd.pid"
+DRILL_INIT_DATA="$DRILL_ROOT/init_dataroot"
+
+# 统一路径映射：将持久化 Bind 数据置于 SYS_ROOT 下，确保 resolve_bind_path 与绝对路径完全对应
+DRILL_BIND_SRC="$DRILL_SYS_ROOT/host_bind_data"
+DRILL_COMPOSE_DIR="$DRILL_SYS_ROOT/compose_proj"
 export DRILL_SYS_ROOT
 
-mkdir -p "$DRILL_BACKUP" "$DRILL_RESTORE_DATA" "$DRILL_BIND_SRC" "$DRILL_COMPOSE_DIR" "$DRILL_SYS_ROOT" "$DRILL_BIN"
+# 固定专属 Docker 端点，严禁使用系统共享套接字
+export DOCKER_HOST="unix://$DRILL_SOCK"
+
+mkdir -p "$DRILL_BACKUP" "$DRILL_RESTORE_DATA" "$DRILL_BIND_SRC" "$DRILL_COMPOSE_DIR" "$DRILL_SYS_ROOT" "$DRILL_BIN" "$DRILL_INIT_DATA"
 
 # 4. 初始化模拟 OpenWrt 服务脚本与工具（解决普通 Linux 缺失 /etc/init.d/dockerd 与 uci 的问题）
 cat << EOF > "$DRILL_SYS_ROOT/etc_init_dockerd"
@@ -140,6 +132,9 @@ cat << EOF > "$DRILL_SYS_ROOT/etc_init_dockerd"
 cmd="\$1"
 STATE_FILE="$DRILL_SYS_ROOT/dockerd_enabled"
 CONFIG_FILE="$DRILL_SYS_ROOT/etc/config/dockerd.data_root"
+PID_FILE="$DRILL_PID_FILE"
+SOCK_FILE="$DRILL_SOCK"
+
 case "\$cmd" in
     enabled)
         [ "\$(cat "\$STATE_FILE" 2>/dev/null || echo 0)" = "1" ] && exit 0 || exit 1
@@ -153,45 +148,63 @@ case "\$cmd" in
         exit 0
         ;;
     stop)
-        pid=\$(pgrep -x dockerd 2>/dev/null || true)
-        if [ -n "\$pid" ]; then
-            kill -TERM \$pid 2>/dev/null || true
-            n=0
-            while [ \$n -lt 30 ]; do
-                if ! pgrep -x dockerd >/dev/null 2>&1; then
-                    break
+        if [ -f "\$PID_FILE" ]; then
+            p=\$(cat "\$PID_FILE" 2>/dev/null || true)
+            if [ -n "\$p" ] && kill -0 "\$p" 2>/dev/null; then
+                kill -TERM "\$p" 2>/dev/null || true
+                n=0
+                while [ \$n -lt 30 ]; do
+                    if ! kill -0 "\$p" 2>/dev/null; then
+                        break
+                    fi
+                    n=\$((n + 1))
+                    sleep 1
+                done
+                if kill -0 "\$p" 2>/dev/null; then
+                    kill -9 "\$p" 2>/dev/null || true
+                    sleep 1
                 fi
-                n=\$((n + 1))
-                sleep 1
-            done
-            if pgrep -x dockerd >/dev/null 2>&1; then
-                kill -9 \$pid 2>/dev/null || true
-                sleep 1
             fi
+            rm -f "\$PID_FILE" "\$SOCK_FILE" 2>/dev/null || true
         fi
         exit 0
         ;;
     start|restart)
-        if ! pgrep -x dockerd >/dev/null 2>&1; then
-            dr=""
-            if [ -f "\$CONFIG_FILE" ]; then
-                dr=\$(cat "\$CONFIG_FILE" 2>/dev/null || echo "")
+        dr="$DRILL_INIT_DATA"
+        if [ -f "\$CONFIG_FILE" ]; then
+            cfg_dr=\$(cat "\$CONFIG_FILE" 2>/dev/null || echo "")
+            [ -n "\$cfg_dr" ] && dr="\$cfg_dr"
+        fi
+        mkdir -p "\$dr"
+        if [ -f "\$PID_FILE" ]; then
+            old_p=\$(cat "\$PID_FILE" 2>/dev/null || true)
+            if [ -n "\$old_p" ] && kill -0 "\$old_p" 2>/dev/null; then
+                exit 0
             fi
-            dr_flag=""
-            [ -n "\$dr" ] && dr_flag="--data-root \$dr"
-            if command -v dockerd-entrypoint.sh >/dev/null 2>&1; then
-                dockerd-entrypoint.sh dockerd \$dr_flag >/dev/null 2>&1 &
-            elif command -v dockerd >/dev/null 2>&1; then
-                dockerd \$dr_flag >/dev/null 2>&1 &
+        fi
+        rm -f "\$SOCK_FILE" 2>/dev/null || true
+        dr_flag="--data-root \$dr"
+        sock_flag="-H unix://\$SOCK_FILE"
+        pid_flag="--pidfile \$PID_FILE"
+        if command -v dockerd-entrypoint.sh >/dev/null 2>&1; then
+            dockerd-entrypoint.sh dockerd \$sock_flag \$pid_flag \$dr_flag >/dev/null 2>&1 &
+        elif command -v dockerd >/dev/null 2>&1; then
+            dockerd \$sock_flag \$pid_flag \$dr_flag >/dev/null 2>&1 &
+        else
+            echo "[DRILL ERROR] 未找到 dockerd 可执行程序！" >&2
+            exit 1
+        fi
+        n=0
+        while [ \$n -lt 30 ]; do
+            if [ -S "\$SOCK_FILE" ] && docker info >/dev/null 2>&1; then
+                break
             fi
-            n=0
-            while [ \$n -lt 30 ]; do
-                if docker info >/dev/null 2>&1; then
-                    break
-                fi
-                n=\$((n + 1))
-                sleep 1
-            done
+            n=\$((n + 1))
+            sleep 1
+        done
+        if [ \$n -ge 30 ]; then
+            echo "[DRILL ERROR] 专属 dockerd 守护进程启动超时！" >&2
+            exit 1
         fi
         exit 0
         ;;
@@ -207,12 +220,29 @@ echo "1" > "$DRILL_SYS_ROOT/dockerd_enabled"
 
 cat << EOF > "$DRILL_BIN/uci"
 #!/bin/sh
-cmd="\$1"
+CONFIG_DIR="$DRILL_SYS_ROOT/etc/config"
+while [ \$# -gt 0 ]; do
+    case "\$1" in
+        -c)
+            shift
+            [ \$# -gt 0 ] && CONFIG_DIR="\$1"
+            shift || true
+            ;;
+        -q)
+            shift || true
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+cmd="\${1:-}"
 shift || true
-CONFIG_FILE="$DRILL_SYS_ROOT/etc/config/dockerd.data_root"
+CONFIG_FILE="\$CONFIG_DIR/dockerd.data_root"
+
 case "\$cmd" in
-    get|-q)
-        [ "\$cmd" = "-q" ] && { cmd="\$1"; shift || true; }
+    get)
         case "\${1:-}" in
             dockerd.globals.data_root)
                 cat "\$CONFIG_FILE" 2>/dev/null || echo ""
@@ -250,9 +280,12 @@ CONTAINER_NAME="drill_standalone_$$"
 SNAPSHOT_IMAGE="backup-snapshot-${CONTAINER_NAME}:latest"
 
 cleanup() {
-    log "正在清理真实演练容器与临时资源..."
+    log "正在清理真实演练容器与专属守护进程..."
     docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
     docker rmi -f "$SNAPSHOT_IMAGE" 2>/dev/null || true
+    if [ -f "$DRILL_SYS_ROOT/etc/init.d/dockerd" ]; then
+        "$DRILL_SYS_ROOT/etc/init.d/dockerd" stop 2>/dev/null || true
+    fi
     rm -rf "$DRILL_ROOT" 2>/dev/null || true
     cleanup_drill_storage
     PATH="$ORIG_PATH"
@@ -261,6 +294,24 @@ trap cleanup EXIT INT TERM
 
 log "=== 开始 AX6600 Docker 真实环境端到端隔离演练 ==="
 log "演练临时根目录: $DRILL_ROOT"
+
+# 启动专属 dockerd 实例
+"$DRILL_SYS_ROOT/etc/init.d/dockerd" start
+
+# 严格校验专属端点
+if [ -z "${DOCKER_HOST:-}" ] || [ "$DOCKER_HOST" != "unix://$DRILL_SOCK" ]; then
+    log_err "DOCKER_HOST 未固定为专属端点: unix://$DRILL_SOCK"
+    exit 1
+fi
+if [ "$DRILL_SOCK" = "/var/run/docker.sock" ]; then
+    log_err "安全阻断: 严禁使用系统公共套接字 /var/run/docker.sock！"
+    exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+    log_err "专属 Docker 端点连接失败！"
+    exit 1
+fi
+log "专属 Docker 守护进程与端点就绪: $DOCKER_HOST"
 
 # 准备持久化绑定数据
 echo "secret_bind_payload_v1" > "$DRILL_BIND_SRC/app_config.env"
@@ -330,6 +381,16 @@ sh "$HELPER_SCRIPT" restore \
 
 # 10. 验收恢复结果
 log "验收容器运行状态与数据一致性..."
+# 校验 Docker 守护进程实际数据目录已准确切换至恢复目标目录
+ACTUAL_DATA_ROOT=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)
+EXPECTED_DATA_ROOT=$(cd "$DRILL_RESTORE_DATA" && pwd -P)
+RESOLVED_ACTUAL=$(cd "$ACTUAL_DATA_ROOT" 2>/dev/null && pwd -P || echo "$ACTUAL_DATA_ROOT")
+if [ "$RESOLVED_ACTUAL" != "$EXPECTED_DATA_ROOT" ]; then
+    log_err "Docker 守护进程 DockerRootDir 未切换至预期目录！预期: $EXPECTED_DATA_ROOT, 实际: $RESOLVED_ACTUAL"
+    exit 1
+fi
+log "DockerRootDir 验证一致: $RESOLVED_ACTUAL"
+
 if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     log_err "独立容器 $CONTAINER_NAME 未成功恢复运行！"
     exit 1

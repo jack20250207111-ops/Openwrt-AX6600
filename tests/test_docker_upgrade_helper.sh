@@ -93,6 +93,9 @@ case "$cmd" in
                     cat "$MOCK_STATE/cmounts_$cid" 2>/dev/null || true
                     ;;
                 *".Mounts"*|*"Mounts"*)
+                    if [ -f "$MOCK_STATE/docker_fail_mounts_inspect" ]; then
+                        exit 1
+                    fi
                     if [ -f "$MOCK_STATE/mounts_$cid" ]; then
                         cat "$MOCK_STATE/mounts_$cid"
                     elif [ -f "$MOCK_STATE/cmounts_$cid" ]; then
@@ -2453,5 +2456,77 @@ echo "--- 测试 23: Compose 原目录已存在时的恢复路径检查 ---"
 )
 echo "PASS: 测试 23 通过（Compose 目标目录已存在时恢复能够正确获取目标绝对路径，空目标路径被严格拦截）"
 
-echo "=== 全部 23 项深度隔离测试与回归演练已通过！ ==="
+# -----------------------------------------------------------------------------
+# 测试 24: 挂载清单读取失败立即阻断（杜绝遗漏 Bind 数据生成伪成功备份），且容器无 Bind 时安全通过
+# -----------------------------------------------------------------------------
+echo "--- 测试 24: 挂载清单读取失败立即阻断与无 Bind 场景验证 ---"
+(
+    T24_DOCKER="$TEST_SANDBOX/t24_docker"
+    T24_TARGET_A="$TEST_SANDBOX/t24_target_nobind"
+    T24_TARGET_B="$TEST_SANDBOX/t24_target_fail"
+    mkdir -p "$T24_DOCKER/volumes" "$T24_TARGET_A" "$T24_TARGET_B"
+    echo "$T24_DOCKER" > "$MOCK_STATE/docker_root_dir"
+
+    echo "c24_cid" > "$MOCK_STATE/containers_list_ids"
+    echo "c24_app" > "$MOCK_STATE/cname_c24_cid"
+    echo "alpine:latest" > "$MOCK_STATE/cimg_c24_cid"
+    : > "$MOCK_STATE/diff_c24_cid"
+    echo "volume|vol24|/data|false" > "$MOCK_STATE/cmounts_c24_cid"
+    : > "$MOCK_STATE/mounts_c24_cid"
+
+    # 24a: 容器确实无 Bind 挂载时，备份正常完成，metadata/bind_mounts.txt 为空，无 docker_bind_mounts.tar.gz
+    set +e
+    sh "$HELPER_SCRIPT" backup \
+        --docker-dir "$T24_DOCKER" \
+        --target-dir "$T24_TARGET_A" \
+        --sys-root "$SYS_ROOT" \
+        --skip-stop >"$TEST_SANDBOX/t24_nobind.log" 2>&1
+    ret_nobind=$?
+    set -e
+    if [ "$ret_nobind" -ne 0 ]; then
+        echo "FAIL: 容器无 Bind 挂载时备份意外失败 (退出码 $ret_nobind): $(cat "$TEST_SANDBOX/t24_nobind.log")"
+        exit 1
+    fi
+    if [ -s "$T24_TARGET_A/metadata/bind_mounts.txt" ]; then
+        echo "FAIL: 无 Bind 挂载时 bind_mounts.txt 不为空！"
+        exit 1
+    fi
+    if [ -f "$T24_TARGET_A/docker_bind_mounts.tar.gz" ]; then
+        echo "FAIL: 无 Bind 挂载时意外生成了 docker_bind_mounts.tar.gz！"
+        exit 1
+    fi
+
+    # 24b: 读取挂载清单失败时（模拟 docker inspect 出错），必须在停机前立即阻断退出，严禁生成伪成功备份
+    T24_HOST_DIR="/t24_host_data"
+    mkdir -p "$SYS_ROOT$T24_HOST_DIR"
+    echo "payload_24" > "$SYS_ROOT$T24_HOST_DIR/file.txt"
+    echo "bind|$T24_HOST_DIR|/data|false" > "$MOCK_STATE/cmounts_c24_cid"
+
+    touch "$MOCK_STATE/docker_fail_mounts_inspect"
+    set +e
+    sh "$HELPER_SCRIPT" backup \
+        --docker-dir "$T24_DOCKER" \
+        --target-dir "$T24_TARGET_B" \
+        --sys-root "$SYS_ROOT" \
+        --skip-stop >"$TEST_SANDBOX/t24_fail.log" 2>&1
+    ret_fail=$?
+    set -e
+    rm -f "$MOCK_STATE/docker_fail_mounts_inspect" "$MOCK_STATE/containers_list_ids" "$MOCK_STATE/cmounts_c24_cid" "$MOCK_STATE/mounts_c24_cid"
+
+    if [ "$ret_fail" -eq 0 ]; then
+        echo "FAIL: docker inspect 挂载清单失败时未被拦截，竟然返回了成功备份！"
+        exit 1
+    fi
+    if ! grep -qiE "(读取容器.*挂载清单失败|无法保证备份完整)" "$TEST_SANDBOX/t24_fail.log"; then
+        echo "FAIL: 拦截报错信息不符合预期: $(cat "$TEST_SANDBOX/t24_fail.log")"
+        exit 1
+    fi
+    if [ -f "$T24_TARGET_B/backup_manifest.txt" ]; then
+        echo "FAIL: 挂载清单导出失败后仍生成了 backup_manifest.txt！"
+        exit 1
+    fi
+)
+echo "PASS: 测试 24 通过（挂载清单导出失败被严格拦截阻断，无 Bind 挂载场景安全通过）"
+
+echo "=== 全部 24 项深度隔离测试与回归演练已通过！ ==="
 
