@@ -925,23 +925,8 @@ do_backup() {
             ep_bin=""
             ep_extra=""
             if [ -n "$centrypoints" ]; then
-                ep_idx=0
-                while IFS= read -r ep_item || [ -n "$ep_item" ]; do
-                    [ -z "$ep_item" ] && continue
-                    ep_idx=$((ep_idx + 1))
-                    if [ "$ep_idx" -eq 1 ]; then
-                        ep_bin="$ep_item"
-                    else
-                        if [ -z "$ep_extra" ]; then
-                            ep_extra="$ep_item"
-                        else
-                            ep_extra="${ep_extra}
-${ep_item}"
-                        fi
-                    fi
-                done << EOF_EP
-$centrypoints
-EOF_EP
+                ep_bin=$(echo "$centrypoints" | head -n 1)
+                ep_extra=$(echo "$centrypoints" | sed '1d')
             fi
 
             cports=$(docker inspect -f '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{if .HostIp}}{{.HostIp}}:{{end}}{{.HostPort}}:{{$p}}
