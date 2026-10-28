@@ -201,27 +201,75 @@ do_precheck() {
     MMC_DEV="/dev/mmcblk0"
     PROC_CMDLINE="$(get_sys_path /proc/cmdline)"
 
-    require_cmd fdisk
-    FDISK_OUT=$(fdisk -l "$MMC_DEV" 2>/dev/null || true)
-    if [ -z "$FDISK_OUT" ]; then
-        log_error "无法读取 eMMC 分区表信息 ($MMC_DEV)，禁止盲刷！"
-        exit 1
+    BOOTCONF_DEV=""
+    HLOS_SEC=0
+    HLOS1_SEC=0
+    ROOTFS_SEC=0
+    ROOTFS1_SEC=0
+
+    # 优先通过 sysfs (/sys/class/block 或 /sys/block/mmcblk0) 读取真实 GPT 分区 PARTNAME 与 size 扇区数
+    SYS_BLOCK="$(get_sys_path /sys/class/block)"
+    if [ ! -d "$SYS_BLOCK" ] && [ -d "$(get_sys_path /sys/block/mmcblk0)" ]; then
+        SYS_BLOCK="$(get_sys_path /sys/block/mmcblk0)"
     fi
 
-    # 尝试定位 0:BOOTCONFIG 分区设备节点 (如 /dev/disk/by-partlabel/0:BOOTCONFIG 或 /dev/mmcblk0p2)
-    CFGPART="$(get_sys_path /dev/disk/by-partlabel/0:BOOTCONFIG)"
-    if [ ! -e "$CFGPART" ]; then
-        BOOTCONF_DEV=$(echo "$FDISK_OUT" | grep -E "[[:space:]]0:BOOTCONFIG[[:space:]]*$" | awk '{print $1}' | head -n 1 || true)
-        if [ -n "$BOOTCONF_DEV" ]; then
-            CFGPART="$(get_sys_path "$BOOTCONF_DEV")"
+    if [ -d "$SYS_BLOCK" ]; then
+        for pdir in "$SYS_BLOCK"/mmcblk0p*; do
+            [ -d "$pdir" ] || continue
+            pdev_name=$(basename "$pdir")
+            uevent_file="$pdir/uevent"
+            size_file="$pdir/size"
+            part_name=""
+            part_sec=0
+            if [ -f "$uevent_file" ]; then
+                part_name=$(grep -E "^PARTNAME=" "$uevent_file" | head -n 1 | cut -d= -f2- || true)
+            fi
+            if [ -f "$size_file" ]; then
+                part_sec=$(cat "$size_file" 2>/dev/null || echo 0)
+            fi
+            case "$part_name" in
+                "0:BOOTCONFIG")
+                    BOOTCONF_DEV="/dev/$pdev_name"
+                    ;;
+                "0:HLOS")
+                    HLOS_SEC="$part_sec"
+                    ;;
+                "0:HLOS_1")
+                    HLOS1_SEC="$part_sec"
+                    ;;
+                "rootfs")
+                    ROOTFS_SEC="$part_sec"
+                    ;;
+                "rootfs_1")
+                    ROOTFS1_SEC="$part_sec"
+                    ;;
+            esac
+        done
+    fi
+
+    # 若 sysfs 未能获取到完整系统分区信息，回退通过 fdisk -l 解析分区
+    if [ "$HLOS_SEC" -eq 0 ] && [ "$ROOTFS_SEC" -eq 0 ]; then
+        require_cmd fdisk
+        FDISK_OUT=$(fdisk -l "$MMC_DEV" 2>/dev/null || true)
+        if [ -n "$FDISK_OUT" ]; then
+            [ -z "$BOOTCONF_DEV" ] && BOOTCONF_DEV=$(echo "$FDISK_OUT" | grep -E "[[:space:]]0:BOOTCONFIG([[:space:]]|$)" | awk '{print $1}' | head -n 1 || true)
+            [ "$HLOS_SEC" -eq 0 ] && HLOS_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]0:HLOS([[:space:]]|$)" | awk '{print $4}' | head -n 1 || echo 0)
+            [ "$HLOS1_SEC" -eq 0 ] && HLOS1_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]0:HLOS_1([[:space:]]|$)" | awk '{print $4}' | head -n 1 || echo 0)
+            [ "$ROOTFS_SEC" -eq 0 ] && ROOTFS_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]rootfs([[:space:]]|$)" | awk '{print $4}' | head -n 1 || echo 0)
+            [ "$ROOTFS1_SEC" -eq 0 ] && ROOTFS1_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]rootfs_1([[:space:]]|$)" | awk '{print $4}' | head -n 1 || echo 0)
         fi
+    fi
+
+    # 尝试定位 0:BOOTCONFIG 分区设备节点 (如 /dev/disk/by-partlabel/0:BOOTCONFIG 或 sysfs 识别的设备)
+    CFGPART="$(get_sys_path /dev/disk/by-partlabel/0:BOOTCONFIG)"
+    if [ ! -e "$CFGPART" ] && [ -n "$BOOTCONF_DEV" ]; then
+        CFGPART="$(get_sys_path "$BOOTCONF_DEV")"
     fi
     if [ ! -e "$CFGPART" ] && [ -e "$(get_sys_path /dev/mmcblk0p2)" ]; then
         CFGPART="$(get_sys_path /dev/mmcblk0p2)"
     fi
 
     PART_NUM=""
-    TARGET_SRC=""
     if [ -e "$CFGPART" ]; then
         if command -v hexdump >/dev/null 2>&1; then
             PART_NUM=$(hexdump -e '1/1 "%01x|"' -n 1 -s 148 -C "$CFGPART" 2>/dev/null | cut -f 1 -d "|" | head -n1 || true)
@@ -239,95 +287,49 @@ do_precheck() {
                 PART_NUM="0"
             fi
         fi
-        if [ -n "$PART_NUM" ]; then
-            TARGET_SRC="0:BOOTCONFIG 分区偏移 148 字节标记 ($PART_NUM)"
-        fi
     fi
 
-    TARGET_KERN=""
-    TARGET_ROOTFS=""
-    if [ "$PART_NUM" = "1" ]; then
-        TARGET_KERN="0:HLOS_1"
-        TARGET_ROOTFS="rootfs_1"
-    elif [ -n "$PART_NUM" ]; then
-        # 严格对齐 qualcommax platform.sh: 读取到 BOOTCONFIG 且非 1 时写入 0:HLOS 与 rootfs
-        TARGET_KERN="0:HLOS"
-        TARGET_ROOTFS="rootfs"
-    else
-        # 若 BOOTCONFIG 读取失败或不存在，回退至 /proc/cmdline 的 root 参数反推对侧
-        ACTIVE_ROOT=""
-        if [ -f "$PROC_CMDLINE" ]; then
-            ACTIVE_ROOT=$(grep -o 'root=[^ ]*' "$PROC_CMDLINE" | head -n 1 | cut -d= -f2 || true)
-        fi
-        if [ -n "$ACTIVE_ROOT" ]; then
-            case "$ACTIVE_ROOT" in
-                *rootfs_1*)
-                    TARGET_KERN="0:HLOS"
-                    TARGET_ROOTFS="rootfs"
-                    TARGET_SRC="cmdline 对侧回退推导 (当前启动: rootfs_1)"
-                    ;;
-                *rootfs*)
-                    TARGET_KERN="0:HLOS_1"
-                    TARGET_ROOTFS="rootfs_1"
-                    TARGET_SRC="cmdline 对侧回退推导 (当前启动: rootfs)"
-                    ;;
-            esac
-        fi
-    fi
-
-    # 提取分区扇区容量
-    HLOS_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]0:HLOS[[:space:]]*$" | awk '{print $4}' || true)
-    HLOS1_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]0:HLOS_1[[:space:]]*$" | awk '{print $4}' || true)
-    ROOTFS_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]rootfs[[:space:]]*$" | awk '{print $4}' || true)
-    ROOTFS1_SEC=$(echo "$FDISK_OUT" | grep -E "[[:space:]]rootfs_1[[:space:]]*$" | awk '{print $4}' || true)
-
-    if [ -z "$ROOTFS_SEC" ] && [ -z "$ROOTFS1_SEC" ]; then
-        ROOTFS_SEC=$(echo "$FDISK_OUT" | grep -w "rootfs" | awk '{print $4}' | head -n 1 || true)
-        ROOTFS1_SEC=$(echo "$FDISK_OUT" | grep -w "rootfs_1" | awk '{print $4}' | head -n 1 || true)
-    fi
-
-    if [ -z "$ROOTFS_SEC" ] && [ -z "$ROOTFS1_SEC" ]; then
-        log_error "未能在分区表中找到 rootfs/rootfs_1 分区信息，目标分区不明，禁止放行！"
+    if [ -z "$PART_NUM" ]; then
+        log_error "无法从 0:BOOTCONFIG 分区读取启动配置标记，待升级目标分区不明，禁止盲刷！"
         exit 1
     fi
 
-    # 若仍无法判定目标分区，取候选根文件系统较小者（严禁取大），确保安全边际
-    if [ -z "$TARGET_ROOTFS" ]; then
-        if [ -n "$ROOTFS_SEC" ] && [ -n "$ROOTFS1_SEC" ]; then
-            if [ "$ROOTFS_SEC" -le "$ROOTFS1_SEC" ]; then
-                TARGET_KERN="0:HLOS"
-                TARGET_ROOTFS="rootfs"
-                TARGET_SRC="候选较小分区安全保底"
-            else
-                TARGET_KERN="0:HLOS_1"
-                TARGET_ROOTFS="rootfs_1"
-                TARGET_SRC="候选较小分区安全保底"
-            fi
-        elif [ -n "$ROOTFS_SEC" ]; then
-            TARGET_KERN="0:HLOS"
-            TARGET_ROOTFS="rootfs"
-            TARGET_SRC="单分区 rootfs"
-        else
-            TARGET_KERN="0:HLOS_1"
-            TARGET_ROOTFS="rootfs_1"
-            TARGET_SRC="单分区 rootfs_1"
-        fi
-    fi
-
+    TARGET_SRC="0:BOOTCONFIG 分区偏移 148 字节标记 ($PART_NUM)"
+    TARGET_KERN=""
+    TARGET_ROOTFS=""
     TARGET_KERN_SEC=0
-    if [ "$TARGET_KERN" = "0:HLOS_1" ] && [ -n "$HLOS1_SEC" ]; then
-        TARGET_KERN_SEC="$HLOS1_SEC"
-    elif [ -n "$HLOS_SEC" ]; then
-        TARGET_KERN_SEC="$HLOS_SEC"
-    fi
-    TARGET_KERN_MB=$((TARGET_KERN_SEC * 512 / 1024 / 1024))
-
     TARGET_ROOTFS_SEC=0
-    if [ "$TARGET_ROOTFS" = "rootfs_1" ] && [ -n "$ROOTFS1_SEC" ]; then
+
+    if [ "$PART_NUM" = "1" ]; then
+        TARGET_KERN="0:HLOS_1"
+        TARGET_ROOTFS="rootfs_1"
+        TARGET_KERN_SEC="$HLOS1_SEC"
         TARGET_ROOTFS_SEC="$ROOTFS1_SEC"
-    elif [ -n "$ROOTFS_SEC" ]; then
+    elif [ "$PART_NUM" = "0" ]; then
+        TARGET_KERN="0:HLOS"
+        TARGET_ROOTFS="rootfs"
+        TARGET_KERN_SEC="$HLOS_SEC"
         TARGET_ROOTFS_SEC="$ROOTFS_SEC"
+    else
+        log_error "0:BOOTCONFIG 偏移 148 字节标记非法 ($PART_NUM)，无法确定目标分区，禁止盲刷！"
+        exit 1
     fi
+
+    case "$TARGET_KERN_SEC" in ''|*[!0-9]*) TARGET_KERN_SEC=0 ;; esac
+    case "$TARGET_ROOTFS_SEC" in ''|*[!0-9]*) TARGET_ROOTFS_SEC=0 ;; esac
+
+    if [ "$TARGET_KERN_SEC" -le 0 ]; then
+        log_error "待升级目标内核分区 [$TARGET_KERN] 未在分区表中找到有效容量记录，禁止借用其他分区容量或盲刷！"
+        exit 1
+    fi
+
+    if [ "$TARGET_ROOTFS_SEC" -le 0 ]; then
+        log_error "待升级目标根文件系统分区 [$TARGET_ROOTFS] 未在分区表中找到有效容量记录，禁止借用其他分区容量或盲刷！"
+        exit 1
+    fi
+
+    TARGET_KERN_BYTES=$((TARGET_KERN_SEC * 512))
+    TARGET_KERN_MB=$((TARGET_KERN_BYTES / 1024 / 1024))
     TARGET_ROOTFS_BYTES=$((TARGET_ROOTFS_SEC * 512))
     TARGET_ROOTFS_MB=$((TARGET_ROOTFS_BYTES / 1024 / 1024))
 
@@ -403,30 +405,59 @@ do_precheck() {
         log_info "固件平台兼容性校验通过"
 
         # 目标内核与根文件系统容量安全阈值核验 (分别严格检查内核目标与根文件系统目标)
-        if [ "$TARGET_KERN_MB" -lt 4 ]; then
-            log_error "待升级目标内核分区 [$TARGET_KERN] 容量仅为 ${TARGET_KERN_MB}MB，小于 4MB 安全阈值！禁止盲刷！"
-            exit 1
+        ACTUAL_KERN_BYTES=0
+        ACTUAL_ROOT_BYTES=0
+        if tar -tf "$IMAGE_PATH" >/dev/null 2>&1; then
+            TAR_ENTRIES=$(tar -tvf "$IMAGE_PATH" 2>/dev/null || true)
+            ACTUAL_KERN_BYTES=$(echo "$TAR_ENTRIES" | awk '$NF ~ /(^|\/)kernel$/ {print $3}' | head -n 1 || echo 0)
+            ACTUAL_ROOT_BYTES=$(echo "$TAR_ENTRIES" | awk '$NF ~ /(^|\/)root$/ {print $3}' | head -n 1 || echo 0)
+            case "$ACTUAL_KERN_BYTES" in ''|*[!0-9]*) ACTUAL_KERN_BYTES=0 ;; esac
+            case "$ACTUAL_ROOT_BYTES" in ''|*[!0-9]*) ACTUAL_ROOT_BYTES=0 ;; esac
+        fi
+
+        if [ "$ACTUAL_KERN_BYTES" -gt 0 ]; then
+            ACTUAL_KERN_MB=$((ACTUAL_KERN_BYTES / 1024 / 1024))
+            log_info "从固件 tar 镜像中提取到实际内核大小: ${ACTUAL_KERN_BYTES} 字节 (${ACTUAL_KERN_MB}MB)"
+            if [ "$ACTUAL_KERN_BYTES" -gt "$TARGET_KERN_BYTES" ]; then
+                log_error "待升级内核大小 (${ACTUAL_KERN_BYTES} 字节) 超过目标内核分区 [$TARGET_KERN] 容量 (${TARGET_KERN_BYTES} 字节)！禁止刷入！"
+                exit 1
+            fi
+        else
+            if [ "$TARGET_KERN_MB" -lt 4 ]; then
+                log_error "待升级目标内核分区 [$TARGET_KERN] 容量仅为 ${TARGET_KERN_MB}MB，小于 4MB 安全阈值！禁止盲刷！"
+                exit 1
+            fi
+        fi
+
+        if [ "$ACTUAL_ROOT_BYTES" -gt 0 ]; then
+            ACTUAL_ROOT_MB=$((ACTUAL_ROOT_BYTES / 1024 / 1024))
+            log_info "从固件 tar 镜像中提取到实际根文件系统大小: ${ACTUAL_ROOT_BYTES} 字节 (${ACTUAL_ROOT_MB}MB)"
+            if [ "$ACTUAL_ROOT_BYTES" -gt "$TARGET_ROOTFS_BYTES" ]; then
+                log_error "目标分区容量不足！待升级根文件系统大小 (${ACTUAL_ROOT_BYTES} 字节) 超过目标根文件系统分区 [$TARGET_ROOTFS] 容量 (${TARGET_ROOTFS_BYTES} 字节)！禁止刷入！"
+                exit 1
+            fi
+            MIN_REQUIRED_BYTES=$((ACTUAL_ROOT_BYTES + 52428800))
+            MIN_REQUIRED_MB=$((MIN_REQUIRED_BYTES / 1024 / 1024))
+            if [ "$TARGET_ROOTFS_BYTES" -le "$MIN_REQUIRED_BYTES" ]; then
+                log_error "目标分区容量 (${TARGET_ROOTFS_MB}MB) 不足！刷入 ${ACTUAL_ROOT_MB}MB 根文件系统需至少 ${MIN_REQUIRED_MB}MB 空间以保留充足 overlay！"
+                exit 1
+            fi
+        else
+            if [ "$IMG_SIZE_MB" -gt "$TARGET_ROOTFS_MB" ]; then
+                log_error "目标分区容量不足！固件大小 (${IMG_SIZE_MB}MB) 超过目标根文件系统分区容量 (${TARGET_ROOTFS_MB}MB)！禁止刷入！"
+                exit 1
+            fi
+
+            MIN_REQUIRED_BYTES=$((IMG_SIZE + 52428800))
+            MIN_REQUIRED_MB=$((MIN_REQUIRED_BYTES / 1024 / 1024))
+            if [ "$TARGET_ROOTFS_BYTES" -le "$MIN_REQUIRED_BYTES" ]; then
+                log_error "目标分区容量 (${TARGET_ROOTFS_MB}MB) 不足！刷入 ${IMG_SIZE_MB}MB 固件需至少 ${MIN_REQUIRED_MB}MB 空间以保留充足 overlay！"
+                exit 1
+            fi
         fi
 
         if [ "$TARGET_ROOTFS_MB" -lt 200 ]; then
             log_error "待升级目标根文件系统分区 [$TARGET_ROOTFS] 容量仅为 ${TARGET_ROOTFS_MB}MB，小于 200MB 安全阈值！严禁在未扩容的分区刷入 PLUS 完整版固件！请选择 PURE 纯净版或通过 U-Boot 重新分区扩容。"
-            exit 1
-        fi
-
-        if [ "$IMG_SIZE_MB" -gt "$TARGET_ROOTFS_MB" ]; then
-            log_error "固件大小 (${IMG_SIZE_MB}MB) 超过目标根文件系统分区容量 (${TARGET_ROOTFS_MB}MB)！禁止刷入！"
-            exit 1
-        fi
-
-        MIN_REQUIRED_BYTES=$((IMG_SIZE + 52428800))
-        MIN_REQUIRED_MB=$((MIN_REQUIRED_BYTES / 1024 / 1024))
-        if [ "$TARGET_ROOTFS_BYTES" -le "$MIN_REQUIRED_BYTES" ]; then
-            log_error "目标分区容量 (${TARGET_ROOTFS_MB}MB) 不足！刷入 ${IMG_SIZE_MB}MB 固件需至少 ${MIN_REQUIRED_MB}MB 空间以保留充足 overlay！"
-            exit 1
-        fi
-
-        if [ "$TARGET_KERN_SEC" -gt 0 ] && [ "$TARGET_KERN_MB" -lt 4 ]; then
-            log_error "待升级目标内核分区 [$TARGET_KERN] 容量异常 (${TARGET_KERN_MB}MB)！"
             exit 1
         fi
 
@@ -657,9 +688,9 @@ do_backup() {
                         log_error "非 Compose 容器 $cname 缺失镜像信息，无法重建！"
                         exit 1
                     fi
-                    echo "$cname" >> "$STANDALONE_MANIFEST"
+                    printf "%s\t%s\n" "$cid" "$cname" >> "$STANDALONE_MANIFEST"
 
-                    # 检查高级/不受支持配置：遇到无法精准还原的参数在备份阶段明确阻断
+                    # 检查高级/不受支持配置：遇到无法精准还原的参数在停机前明确阻断
                     net_count=$(docker inspect -f '{{len .NetworkSettings.Networks}}' "$cid" 2>/dev/null || echo 1)
                     case "$net_count" in ''|*[!0-9]*) net_count=1 ;; esac
                     if [ "$net_count" -gt 1 ]; then
@@ -671,6 +702,22 @@ do_backup() {
                     case "$cnet" in
                         container:*)
                             log_error "独立容器 $cname 网络模式依赖其他容器 ($cnet)，无法单独重建！为防止配置丢失，已在备份阶段阻断。请将其迁移为 Docker Compose 编排管理。"
+                            exit 1
+                            ;;
+                    esac
+
+                    cipc=$(docker inspect -f '{{.HostConfig.IpcMode}}' "$cid" 2>/dev/null || true)
+                    case "$cipc" in
+                        container:*)
+                            log_error "独立容器 $cname IPC 模式依赖其他容器 ($cipc)，无法单独重建！已在备份阶段阻断。请将其迁移为 Docker Compose 编排管理。"
+                            exit 1
+                            ;;
+                    esac
+
+                    cpid=$(docker inspect -f '{{.HostConfig.PidMode}}' "$cid" 2>/dev/null || true)
+                    case "$cpid" in
+                        container:*)
+                            log_error "独立容器 $cname PID 模式依赖其他容器 ($cpid)，无法单独重建！已在备份阶段阻断。请将其迁移为 Docker Compose 编排管理。"
                             exit 1
                             ;;
                     esac
@@ -695,155 +742,36 @@ do_backup() {
                         exit 1
                     fi
 
-                    # 导出镜像（有可写层改动则 commit 快照，无可写层变动则直接导出基础镜像，确保脱机可恢复）
-                    has_diff=0
-                    diff_out=$(docker diff "$cid" 2>/dev/null || true)
-                    filtered_diff=$(echo "$diff_out" | grep -vE "^[ACD] (/tmp|/run|/var/log|/var/run|/dev)" || true)
-                    img_for_run="$cimg"
-                    if [ -n "$filtered_diff" ]; then
-                        has_diff=1
-                        log_info "容器 $cname 可写层存在变动，执行 commit 保存增量镜像快照..."
-                        snap_tag="backup-snapshot-$cname:latest"
-                        docker commit "$cid" "$snap_tag" || {
-                            log_error "容器 $cname commit 快照失败！"
-                            exit 1
-                        }
-                        docker save "$snap_tag" -o "$STANDALONE_STORE/image_${cname}.tar" || {
-                            log_error "导出容器 $cname 快照镜像失败！"
-                            exit 1
-                        }
-                        img_for_run="$snap_tag"
-                    else
-                        log_info "容器 $cname 可写层无变动，导出基础镜像: $cimg ..."
-                        docker save "$cimg" -o "$STANDALONE_STORE/image_${cname}.tar" || {
-                            log_error "导出容器 $cname 基础镜像 $cimg 失败！"
-                            exit 1
-                        }
-                    fi
-                    i_kb=$(du -sk "$STANDALONE_STORE/image_${cname}.tar" 2>/dev/null | awk '{print $1}' || echo 0)
-                    TOTAL_NEED_KB=$((TOTAL_NEED_KB + i_kb))
-
-                    # 生成独立容器重建脚本（完整还原支持的设置：-e, -p, -v, --net, --restart, --privileged, -u, -w, -h, --entrypoint, --device, --cap-add, --cap-drop, --dns, Cmd）
-                    rec_script="$STANDALONE_STORE/recreate_${cname}.sh"
-                    crestart_name=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$cid" 2>/dev/null || true)
-                    crestart_max=$(docker inspect -f '{{.HostConfig.RestartPolicy.MaximumRetryCount}}' "$cid" 2>/dev/null || true)
-                    case "$crestart_max" in ''|*[!0-9]*) crestart_max=0 ;; esac
-                    crestart="$crestart_name"
-                    if [ "$crestart_name" = "on-failure" ] && [ -n "$crestart_max" ] && [ "$crestart_max" -gt 0 ]; then
-                        crestart="on-failure:$crestart_max"
-                    fi
-
-                    cpriv=$(docker inspect -f '{{.HostConfig.Privileged}}' "$cid" 2>/dev/null || true)
-                    cuser=$(docker inspect -f '{{.Config.User}}' "$cid" 2>/dev/null || true)
-                    cworkdir=$(docker inspect -f '{{.Config.WorkingDir}}' "$cid" 2>/dev/null || true)
-                    chostname=$(docker inspect -f '{{.Config.Hostname}}' "$cid" 2>/dev/null || true)
-                    centrypoint=$(docker inspect -f '{{range .Config.Entrypoint}}{{.}} {{end}}' "$cid" 2>/dev/null || true)
-                    centrypoint=$(echo "$centrypoint" | awk '{print $1}')
-
-                    cports=$(docker inspect -f '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{if .HostIp}}{{.HostIp}}:{{end}}{{.HostPort}}:{{$p}}
-{{end}}{{end}}' "$cid" 2>/dev/null || true)
-
-                    cenvs=$(docker inspect -f '{{range .Config.Env}}{{.}}
+                    # 检查 HostConfig.Mounts（--mount）配置
+                    cmounts_raw=$(docker inspect -f '{{range .HostConfig.Mounts}}{{.Type}}|{{.Source}}|{{.Target}}|{{.ReadOnly}}
 {{end}}' "$cid" 2>/dev/null || true)
-
-                    cbinds=$(docker inspect -f '{{range .HostConfig.Binds}}{{.}}
-{{end}}' "$cid" 2>/dev/null || true)
-
-                    cdevices=$(docker inspect -f '{{range .HostConfig.Devices}}{{.PathOnHost}}:{{.PathInContainer}}:{{.CgroupPermissions}}
-{{end}}' "$cid" 2>/dev/null || true)
-
-                    ccaps_add=$(docker inspect -f '{{range .HostConfig.CapAdd}}{{.}}
-{{end}}' "$cid" 2>/dev/null || true)
-
-                    ccaps_drop=$(docker inspect -f '{{range .HostConfig.CapDrop}}{{.}}
-{{end}}' "$cid" 2>/dev/null || true)
-
-                    cdns=$(docker inspect -f '{{range .HostConfig.Dns}}{{.}}
-{{end}}' "$cid" 2>/dev/null || true)
-
-                    ccmd=$(docker inspect -f '{{range .Config.Cmd}}{{.}}
-{{end}}' "$cid" 2>/dev/null || true)
-
-                    cat << EOF_REC > "$rec_script"
-#!/bin/sh
-set -e
-STANDALONE_DIR="\${STANDALONE_DIR:-\$(cd "\$(dirname "\$0")" && pwd -P)}"
-echo "正在重建独立容器: $cname..."
-docker rm -f "$cname" 2>/dev/null || true
-if [ -f "\$STANDALONE_DIR/image_${cname}.tar" ]; then
-    docker load -i "\$STANDALONE_DIR/image_${cname}.tar"
-fi
-EOF_REC
-
-                    printf "docker run -d --name '%s'" "$(sh_escape "$cname")" >> "$rec_script"
-                    [ -n "$cnet" ] && [ "$cnet" != "default" ] && printf " --net '%s'" "$(sh_escape "$cnet")" >> "$rec_script"
-                    [ -n "$crestart" ] && [ "$crestart" != "no" ] && printf " --restart '%s'" "$(sh_escape "$crestart")" >> "$rec_script"
-                    [ "$cpriv" = "true" ] && printf " --privileged" >> "$rec_script"
-                    [ -n "$cuser" ] && printf " -u '%s'" "$(sh_escape "$cuser")" >> "$rec_script"
-                    [ -n "$cworkdir" ] && printf " -w '%s'" "$(sh_escape "$cworkdir")" >> "$rec_script"
-                    [ -n "$chostname" ] && printf " -h '%s'" "$(sh_escape "$chostname")" >> "$rec_script"
-                    [ -n "$centrypoint" ] && printf " --entrypoint '%s'" "$(sh_escape "$centrypoint")" >> "$rec_script"
-
-                    if [ -n "$cports" ]; then
-                        echo "$cports" | while IFS= read -r p_item || [ -n "$p_item" ]; do
-                            [ -z "$p_item" ] && continue
-                            printf " -p '%s'" "$(sh_escape "$p_item")" >> "$rec_script"
+                    if [ -n "$cmounts_raw" ]; then
+                        echo "$cmounts_raw" | while IFS= read -r mline || [ -n "$mline" ]; do
+                            [ -z "$mline" ] && continue
+                            m_type=$(echo "$mline" | cut -d'|' -f1)
+                            m_src=$(echo "$mline" | cut -d'|' -f2)
+                            case "$m_type" in
+                                bind)
+                                    if [ -n "$m_src" ]; then
+                                        actual_msrc=$(resolve_bind_path "$m_src")
+                                        if [ ! -e "$actual_msrc" ]; then
+                                            log_error "独立容器 $cname 的 --mount bind 宿主机路径不存在: $m_src ，无法保证备份完整！已在修改服务状态前阻断。"
+                                            exit 1
+                                        fi
+                                    fi
+                                    ;;
+                                volume|tmpfs)
+                                    ;;
+                                *)
+                                    log_error "独立容器 $cname 使用了不受支持的 Mount 类型 ($m_type)！已在备份阶段阻断。请将其迁移为 Docker Compose 编排管理。"
+                                    exit 1
+                                    ;;
+                            esac
                         done
                     fi
 
-                    if [ -n "$cenvs" ]; then
-                        echo "$cenvs" | while IFS= read -r e_item || [ -n "$e_item" ]; do
-                            [ -z "$e_item" ] && continue
-                            printf " -e '%s'" "$(sh_escape "$e_item")" >> "$rec_script"
-                        done
-                    fi
-
-                    if [ -n "$cbinds" ]; then
-                        echo "$cbinds" | while IFS= read -r b_item || [ -n "$b_item" ]; do
-                            [ -z "$b_item" ] && continue
-                            printf " -v '%s'" "$(sh_escape "$b_item")" >> "$rec_script"
-                        done
-                    fi
-
-                    if [ -n "$cdevices" ]; then
-                        echo "$cdevices" | while IFS= read -r d_item || [ -n "$d_item" ]; do
-                            [ -z "$d_item" ] && continue
-                            printf " --device '%s'" "$(sh_escape "$d_item")" >> "$rec_script"
-                        done
-                    fi
-
-                    if [ -n "$ccaps_add" ]; then
-                        echo "$ccaps_add" | while IFS= read -r ca_item || [ -n "$ca_item" ]; do
-                            [ -z "$ca_item" ] && continue
-                            printf " --cap-add '%s'" "$(sh_escape "$ca_item")" >> "$rec_script"
-                        done
-                    fi
-
-                    if [ -n "$ccaps_drop" ]; then
-                        echo "$ccaps_drop" | while IFS= read -r cd_item || [ -n "$cd_item" ]; do
-                            [ -z "$cd_item" ] && continue
-                            printf " --cap-drop '%s'" "$(sh_escape "$cd_item")" >> "$rec_script"
-                        done
-                    fi
-
-                    if [ -n "$cdns" ]; then
-                        echo "$cdns" | while IFS= read -r dns_item || [ -n "$dns_item" ]; do
-                            [ -z "$dns_item" ] && continue
-                            printf " --dns '%s'" "$(sh_escape "$dns_item")" >> "$rec_script"
-                        done
-                    fi
-
-                    printf " '%s'" "$(sh_escape "$img_for_run")" >> "$rec_script"
-
-                    if [ -n "$ccmd" ]; then
-                        echo "$ccmd" | while IFS= read -r a_item || [ -n "$a_item" ]; do
-                            [ -z "$a_item" ] && continue
-                            printf " '%s'" "$(sh_escape "$a_item")" >> "$rec_script"
-                        done
-                    fi
-
-                    printf "\n" >> "$rec_script"
-                    chmod +x "$rec_script"
+                    # 估算容器基础镜像所需空间
+                    TOTAL_NEED_KB=$((TOTAL_NEED_KB + 51200))
                 fi
             done
         fi
@@ -860,7 +788,7 @@ EOF_REC
             fi
         fi
 
-        # 扫描外部 Bind Mounts
+        # 扫描外部 Bind Mounts (覆盖 HostConfig.Binds 与 HostConfig.Mounts)
         : > "$META_DIR/bind_mounts_raw.txt"
         grep -o '"Source": "[^"]*"' "$META_DIR/containers_inspect.json" 2>/dev/null | awk -F'"' '{print $4}' >> "$META_DIR/bind_mounts_raw.txt" || true
         grep -o '"/[^"]*:[^"]*"' "$META_DIR/containers_inspect.json" 2>/dev/null | awk -F'"' '{print $2}' | awk -F':' '{print $1}' >> "$META_DIR/bind_mounts_raw.txt" || true
@@ -892,7 +820,7 @@ EOF_REC
         TOTAL_NEED_KB=$((TOTAL_NEED_KB + v_kb))
     fi
 
-    # 完整覆盖全部待备份数据的空间检查
+    # 完整覆盖全部待备份数据的空间检查（修改任何服务状态前先核验目标存储）
     check_space_safety "$TARGET_ABS" "$TOTAL_NEED_KB"
 
     # 4. 记录原开机自启状态并在升级前安全禁用
@@ -920,12 +848,13 @@ EOF_REC
         echo "0" > "$AUTOSTART_FILE"
     fi
 
-    # 5. 优雅停机（容器 -> 守护进程）
+    # 5. 严格停机与快照执行顺序：
+    # 导出元数据和热备 → 停容器 → commit/save 快照 → 停 dockerd → 归档持久化数据
     if [ "$SKIP_CONTAINER_STOP" -eq 0 ]; then
         if command -v docker >/dev/null 2>&1; then
             RUNNING=$(docker ps -q 2>/dev/null || true)
             if [ -n "$RUNNING" ]; then
-                log_info "正在停止运行中的 Docker 容器以保证冷备一致性..."
+                log_info "正在停止运行中的 Docker 容器以保证数据落盘与冷备一致性..."
                 if ! docker stop $RUNNING >/dev/null; then
                     log_error "停止容器失败！无法保证冷备数据一致性。若需恢复原服务状态，请执行: $INIT_DOCKERD start"
                     [ "$WAS_ENABLED" = "1" ] && [ -x "$INIT_DOCKERD" ] && "$INIT_DOCKERD" enable 2>/dev/null || true
@@ -933,7 +862,233 @@ EOF_REC
                 fi
             fi
         fi
+    fi
 
+    # 5b. 容器停机后执行 commit/save 保存快照（此时容器已完成关机落盘，可写层为最新一致性数据）
+    if [ -f "$STANDALONE_MANIFEST" ] && command -v docker >/dev/null 2>&1; then
+        while IFS='	' read -r scid scname || [ -n "$scid" ]; do
+            [ -z "$scid" ] && continue
+            if [ -n "$scname" ]; then
+                cid="$scid"
+                cname="$scname"
+            else
+                cname="$scid"
+                cid=$(docker inspect -f '{{.Id}}' "$cname" 2>/dev/null || echo "")
+                [ -z "$cid" ] && cid="$cname"
+            fi
+            cimg=$(docker inspect -f '{{.Config.Image}}' "$cid" 2>/dev/null || true)
+
+            has_diff=0
+            diff_out=$(docker diff "$cid" 2>/dev/null || true)
+            filtered_diff=$(echo "$diff_out" | grep -vE "^[ACD] (/tmp|/run|/var/log|/var/run|/dev)" || true)
+            img_for_run="$cimg"
+            if [ -n "$filtered_diff" ]; then
+                has_diff=1
+                log_info "容器 $cname 停机后可写层存在变动，执行 commit 保存增量镜像快照..."
+                snap_tag="backup-snapshot-$cname:latest"
+                docker commit "$cid" "$snap_tag" || {
+                    log_error "容器 $cname commit 快照失败！"
+                    exit 1
+                }
+                docker save "$snap_tag" -o "$STANDALONE_STORE/image_${cname}.tar" || {
+                    log_error "导出容器 $cname 快照镜像失败！"
+                    exit 1
+                }
+                img_for_run="$snap_tag"
+            else
+                log_info "容器 $cname 可写层无变动，导出基础镜像: $cimg ..."
+                docker save "$cimg" -o "$STANDALONE_STORE/image_${cname}.tar" || {
+                    log_error "导出容器 $cname 基础镜像 $cimg 失败！"
+                    exit 1
+                }
+            fi
+
+            # 生成独立容器重建脚本（完整还原支持的设置：-e, -p, -v, --mount, --net, --restart, --privileged, -u, -w, -h, --entrypoint, --device, --cap-add, --cap-drop, --dns, Cmd）
+            rec_script="$STANDALONE_STORE/recreate_${cname}.sh"
+            crestart_name=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$cid" 2>/dev/null || true)
+            crestart_max=$(docker inspect -f '{{.HostConfig.RestartPolicy.MaximumRetryCount}}' "$cid" 2>/dev/null || true)
+            case "$crestart_max" in ''|*[!0-9]*) crestart_max=0 ;; esac
+            crestart="$crestart_name"
+            if [ "$crestart_name" = "on-failure" ] && [ -n "$crestart_max" ] && [ "$crestart_max" -gt 0 ]; then
+                crestart="on-failure:$crestart_max"
+            fi
+
+            cnet=$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$cid" 2>/dev/null || true)
+            cpriv=$(docker inspect -f '{{.HostConfig.Privileged}}' "$cid" 2>/dev/null || true)
+            cuser=$(docker inspect -f '{{.Config.User}}' "$cid" 2>/dev/null || true)
+            cworkdir=$(docker inspect -f '{{.Config.WorkingDir}}' "$cid" 2>/dev/null || true)
+            chostname=$(docker inspect -f '{{.Config.Hostname}}' "$cid" 2>/dev/null || true)
+
+            # 完整解析 Entrypoint 参数（支持多参数 /bin/sh -c 等）
+            centrypoints=$(docker inspect -f '{{range .Config.Entrypoint}}{{.}}
+{{end}}' "$cid" 2>/dev/null || true)
+            ep_bin=""
+            ep_extra=""
+            if [ -n "$centrypoints" ]; then
+                ep_idx=0
+                while IFS= read -r ep_item || [ -n "$ep_item" ]; do
+                    [ -z "$ep_item" ] && continue
+                    ep_idx=$((ep_idx + 1))
+                    if [ "$ep_idx" -eq 1 ]; then
+                        ep_bin="$ep_item"
+                    else
+                        if [ -z "$ep_extra" ]; then
+                            ep_extra="$ep_item"
+                        else
+                            ep_extra="${ep_extra}
+${ep_item}"
+                        fi
+                    fi
+                done << EOF_EP
+$centrypoints
+EOF_EP
+            fi
+
+            cports=$(docker inspect -f '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{if .HostIp}}{{.HostIp}}:{{end}}{{.HostPort}}:{{$p}}
+{{end}}{{end}}' "$cid" 2>/dev/null || true)
+
+            cenvs=$(docker inspect -f '{{range .Config.Env}}{{.}}
+{{end}}' "$cid" 2>/dev/null || true)
+
+            cbinds=$(docker inspect -f '{{range .HostConfig.Binds}}{{.}}
+{{end}}' "$cid" 2>/dev/null || true)
+
+            cmounts=$(docker inspect -f '{{range .HostConfig.Mounts}}{{.Type}}|{{.Source}}|{{.Target}}|{{.ReadOnly}}
+{{end}}' "$cid" 2>/dev/null || true)
+
+            cdevices=$(docker inspect -f '{{range .HostConfig.Devices}}{{.PathOnHost}}:{{.PathInContainer}}:{{.CgroupPermissions}}
+{{end}}' "$cid" 2>/dev/null || true)
+
+            ccaps_add=$(docker inspect -f '{{range .HostConfig.CapAdd}}{{.}}
+{{end}}' "$cid" 2>/dev/null || true)
+
+            ccaps_drop=$(docker inspect -f '{{range .HostConfig.CapDrop}}{{.}}
+{{end}}' "$cid" 2>/dev/null || true)
+
+            cdns=$(docker inspect -f '{{range .HostConfig.Dns}}{{.}}
+{{end}}' "$cid" 2>/dev/null || true)
+
+            ccmd=$(docker inspect -f '{{range .Config.Cmd}}{{.}}
+{{end}}' "$cid" 2>/dev/null || true)
+
+            cat << EOF_REC > "$rec_script"
+#!/bin/sh
+set -e
+STANDALONE_DIR="\${STANDALONE_DIR:-\$(cd "\$(dirname "\$0")" && pwd -P)}"
+echo "正在重建独立容器: $cname..."
+docker rm -f "$cname" 2>/dev/null || true
+if [ -f "\$STANDALONE_DIR/image_${cname}.tar" ]; then
+    docker load -i "\$STANDALONE_DIR/image_${cname}.tar"
+fi
+EOF_REC
+
+            printf "docker run -d --name '%s'" "$(sh_escape "$cname")" >> "$rec_script"
+            [ -n "$cnet" ] && [ "$cnet" != "default" ] && printf " --net '%s'" "$(sh_escape "$cnet")" >> "$rec_script"
+            [ -n "$crestart" ] && [ "$crestart" != "no" ] && printf " --restart '%s'" "$(sh_escape "$crestart")" >> "$rec_script"
+            [ "$cpriv" = "true" ] && printf " --privileged" >> "$rec_script"
+            [ -n "$cuser" ] && printf " -u '%s'" "$(sh_escape "$cuser")" >> "$rec_script"
+            [ -n "$cworkdir" ] && printf " -w '%s'" "$(sh_escape "$cworkdir")" >> "$rec_script"
+            [ -n "$chostname" ] && printf " -h '%s'" "$(sh_escape "$chostname")" >> "$rec_script"
+            [ -n "$ep_bin" ] && printf " --entrypoint '%s'" "$(sh_escape "$ep_bin")" >> "$rec_script"
+
+            if [ -n "$cports" ]; then
+                echo "$cports" | while IFS= read -r p_item || [ -n "$p_item" ]; do
+                    [ -z "$p_item" ] && continue
+                    printf " -p '%s'" "$(sh_escape "$p_item")" >> "$rec_script"
+                done
+            fi
+
+            if [ -n "$cenvs" ]; then
+                echo "$cenvs" | while IFS= read -r e_item || [ -n "$e_item" ]; do
+                    [ -z "$e_item" ] && continue
+                    printf " -e '%s'" "$(sh_escape "$e_item")" >> "$rec_script"
+                done
+            fi
+
+            if [ -n "$cbinds" ]; then
+                echo "$cbinds" | while IFS= read -r b_item || [ -n "$b_item" ]; do
+                    [ -z "$b_item" ] && continue
+                    printf " -v '%s'" "$(sh_escape "$b_item")" >> "$rec_script"
+                done
+            fi
+
+            if [ -n "$cmounts" ]; then
+                echo "$cmounts" | while IFS= read -r mline || [ -n "$mline" ]; do
+                    [ -z "$mline" ] && continue
+                    m_type=$(echo "$mline" | cut -d'|' -f1)
+                    m_src=$(echo "$mline" | cut -d'|' -f2)
+                    m_dst=$(echo "$mline" | cut -d'|' -f3)
+                    m_ro=$(echo "$mline" | cut -d'|' -f4)
+                    case "$m_type" in
+                        bind)
+                            m_opt="type=bind,source=$m_src,target=$m_dst"
+                            [ "$m_ro" = "true" ] && m_opt="${m_opt},readonly"
+                            printf " --mount '%s'" "$(sh_escape "$m_opt")" >> "$rec_script"
+                            ;;
+                        volume)
+                            m_opt="type=volume,source=$m_src,target=$m_dst"
+                            [ "$m_ro" = "true" ] && m_opt="${m_opt},readonly"
+                            printf " --mount '%s'" "$(sh_escape "$m_opt")" >> "$rec_script"
+                            ;;
+                        tmpfs)
+                            m_opt="type=tmpfs,target=$m_dst"
+                            printf " --mount '%s'" "$(sh_escape "$m_opt")" >> "$rec_script"
+                            ;;
+                    esac
+                done
+            fi
+
+            if [ -n "$cdevices" ]; then
+                echo "$cdevices" | while IFS= read -r d_item || [ -n "$d_item" ]; do
+                    [ -z "$d_item" ] && continue
+                    printf " --device '%s'" "$(sh_escape "$d_item")" >> "$rec_script"
+                done
+            fi
+
+            if [ -n "$ccaps_add" ]; then
+                echo "$ccaps_add" | while IFS= read -r ca_item || [ -n "$ca_item" ]; do
+                    [ -z "$ca_item" ] && continue
+                    printf " --cap-add '%s'" "$(sh_escape "$ca_item")" >> "$rec_script"
+                done
+            fi
+
+            if [ -n "$ccaps_drop" ]; then
+                echo "$ccaps_drop" | while IFS= read -r cd_item || [ -n "$cd_item" ]; do
+                    [ -z "$cd_item" ] && continue
+                    printf " --cap-drop '%s'" "$(sh_escape "$cd_item")" >> "$rec_script"
+                done
+            fi
+
+            if [ -n "$cdns" ]; then
+                echo "$cdns" | while IFS= read -r dns_item || [ -n "$dns_item" ]; do
+                    [ -z "$dns_item" ] && continue
+                    printf " --dns '%s'" "$(sh_escape "$dns_item")" >> "$rec_script"
+                done
+            fi
+
+            printf " '%s'" "$(sh_escape "$img_for_run")" >> "$rec_script"
+
+            if [ -n "$ep_extra" ]; then
+                echo "$ep_extra" | while IFS= read -r ep_arg || [ -n "$ep_arg" ]; do
+                    [ -z "$ep_arg" ] && continue
+                    printf " '%s'" "$(sh_escape "$ep_arg")" >> "$rec_script"
+                done
+            fi
+
+            if [ -n "$ccmd" ]; then
+                echo "$ccmd" | while IFS= read -r a_item || [ -n "$a_item" ]; do
+                    [ -z "$a_item" ] && continue
+                    printf " '%s'" "$(sh_escape "$a_item")" >> "$rec_script"
+                done
+            fi
+
+            printf "\n" >> "$rec_script"
+            chmod +x "$rec_script"
+        done < "$STANDALONE_MANIFEST"
+    fi
+
+    # 5c. 停止 dockerd 守护进程
+    if [ "$SKIP_CONTAINER_STOP" -eq 0 ]; then
         if [ -x "$INIT_DOCKERD" ]; then
             log_info "停止 dockerd 守护进程..."
             if ! "$INIT_DOCKERD" stop >/dev/null; then
@@ -978,8 +1133,13 @@ EOF_REC
     # 7. 归档 Named Volumes 并校验完整性
     require_cmd tar
     VOL_ARCHIVE="$TARGET_ABS/docker_volumes.tar.gz"
+    UNCOMP_FILE="$META_DIR/uncompressed_sizes.tsv"
+    : > "$UNCOMP_FILE"
+
     if [ -d "$DOCKER_ROOT_DIR/volumes" ]; then
         log_info "正在归档 Named Volumes..."
+        vol_uncomp_kb=$(du -sk "$DOCKER_ROOT_DIR/volumes" 2>/dev/null | awk '{print $1}' || echo 0)
+        echo "volumes	docker_volumes.tar.gz	$vol_uncomp_kb" >> "$UNCOMP_FILE"
         tar -czf "$VOL_ARCHIVE" -C "$DOCKER_ROOT_DIR" volumes || {
             log_error "Named Volumes 归档打包失败！"
             exit 1
@@ -998,6 +1158,7 @@ EOF_REC
             fi
         done
     else
+        echo "volumes	docker_volumes.tar.gz	0" >> "$UNCOMP_FILE"
         mkdir -p "$TARGET_ABS/.empty_vol/volumes"
         tar -czf "$VOL_ARCHIVE" -C "$TARGET_ABS/.empty_vol" volumes
         rm -rf "$TARGET_ABS/.empty_vol"
@@ -1015,6 +1176,8 @@ EOF_REC
             actual_cdir=$(resolve_bind_path "$cdir")
             if [ -d "$actual_cdir" ]; then
                 proj_archive="$COMPOSE_STORE/${cproj}.tar.gz"
+                proj_uncomp_kb=$(du -sk "$actual_cdir" 2>/dev/null | awk '{print $1}' || echo 0)
+                echo "compose	$cproj	${cproj}.tar.gz	$proj_uncomp_kb" >> "$UNCOMP_FILE"
                 tar -czf "$proj_archive" -C "$actual_cdir" . || {
                     log_error "归档 Compose 项目 $cproj 失败！"
                     exit 1
@@ -1036,20 +1199,27 @@ EOF_REC
         log_info "正在归档外部 Bind Mounts 数据..."
         TAR_FILE_LIST="$META_DIR/tar_bind_list.txt"
         : > "$TAR_FILE_LIST"
-        if [ -n "$SYS_ROOT" ]; then
-            while IFS= read -r mpath; do
-                [ -z "$mpath" ] && continue
-                actual_p=$(resolve_bind_path "$mpath")
+        while IFS= read -r mpath; do
+            [ -z "$mpath" ] && continue
+            actual_p=$(resolve_bind_path "$mpath")
+            b_uncomp_kb=$(du -sk "$actual_p" 2>/dev/null | awk '{print $1}' || echo 0)
+            echo "bind	$mpath	docker_bind_mounts.tar.gz	$b_uncomp_kb" >> "$UNCOMP_FILE"
+            if [ -n "$SYS_ROOT" ]; then
                 rel_p="${actual_p#$SYS_ROOT}"
                 rel_p="${rel_p#/}"
                 echo "$rel_p" >> "$TAR_FILE_LIST"
-            done < "$BIND_MOUNTS_FILE"
+            else
+                echo "${mpath#/}" >> "$TAR_FILE_LIST"
+            fi
+        done < "$BIND_MOUNTS_FILE"
+
+        if [ -n "$SYS_ROOT" ]; then
             tar -czf "$BIND_ARCHIVE" -C "$SYS_ROOT" -T "$TAR_FILE_LIST" || {
                 log_error "Bind Mounts 归档打包失败！"
                 exit 1
             }
         else
-            tar -czf "$BIND_ARCHIVE" -C / -T "$BIND_MOUNTS_FILE" || {
+            tar -czf "$BIND_ARCHIVE" -C / -T "$TAR_FILE_LIST" || {
                 log_error "Bind Mounts 归档打包失败！"
                 exit 1
             }
@@ -1076,17 +1246,17 @@ EOF_REC
         done < "$BIND_MOUNTS_FILE"
     fi
 
-    # 10. 生成全局备份校验清单与 SHA256 校验和（覆盖所有归档、脚本、配置与数据库）
+    # 10. 生成全局备份校验清单与 SHA256 校验和（覆盖所有归档、脚本、配置与数据库，严格排除清单自身并立即自检）
     log_info "生成全局备份校验清单与 SHA256 校验和..."
     require_cmd sha256sum
     (
         cd "$TARGET_ABS"
-        rm -f sha256sums.txt backup_manifest.txt
-        # 遍历目标目录下所有常规文件（不遗漏任何 compose、standalone、脚本或配置文件）
-        find . -type f | sort | while IFS= read -r f; do
+        rm -f sha256sums.txt backup_manifest.txt .sha256sums.tmp
+        # 遍历目标目录下所有常规文件，严格排除校验清单自身、backup_manifest.txt 与任何以点开头的临时文件
+        find . -type f ! -name "sha256sums.txt" ! -name "backup_manifest.txt" ! -name ".*" | sort | while IFS= read -r f; do
             clean_f="${f#./}"
             sha256sum "$clean_f"
-        done > sha256sums.txt
+        done > .sha256sums.tmp
 
         {
             echo "AX6600 Docker 备份摘要清单"
@@ -1097,12 +1267,24 @@ EOF_REC
             [ -f "docker_bind_mounts.tar.gz" ] && echo "Bind Mounts 归档: docker_bind_mounts.tar.gz"
             echo "Compose 项目数: $(wc -l < metadata/compose_manifest.tsv 2>/dev/null || echo 0)"
             echo "独立容器数: $(wc -l < metadata/standalone_manifest.txt 2>/dev/null || echo 0)"
-            echo "备份文件总数: $(wc -l < sha256sums.txt)"
+            echo "备份文件总数: $(( $(wc -l < .sha256sums.tmp) + 1 ))"
+            echo ""
+            echo "[UNCOMPRESSED_SIZES_KB]"
+            cat metadata/uncompressed_sizes.tsv 2>/dev/null || true
             echo ""
             echo "[FILES]"
-            sed 's/^[0-9a-fA-F]* [ *]*//' sha256sums.txt
+            sed 's/^[0-9a-fA-F]* [ *]*//' .sha256sums.tmp
+            echo "backup_manifest.txt"
         } > backup_manifest.txt
-        sha256sum backup_manifest.txt >> sha256sums.txt
+        sha256sum backup_manifest.txt >> .sha256sums.tmp
+        mv .sha256sums.tmp sha256sums.txt
+
+        log_info "正在对生成的备份文件与校验清单执行即时自检核验..."
+        if ! sha256sum -c sha256sums.txt >/dev/null 2>&1; then
+            log_error "备份文件自检核验失败！"
+            exit 1
+        fi
+        log_info "备份文件自检核验通过"
     )
 
     log_info "Docker 完整备份完成，校验清单与全部文件哈希位于: $TARGET_ABS/sha256sums.txt"
@@ -1182,8 +1364,13 @@ do_restore() {
 
     STANDALONE_MANIFEST="$BACKUP_DIR/metadata/standalone_manifest.txt"
     if [ -f "$STANDALONE_MANIFEST" ]; then
-        while IFS= read -r cname || [ -n "$cname" ]; do
-            [ -z "$cname" ] && continue
+        while IFS='	' read -r scid scname || [ -n "$scid" ]; do
+            [ -z "$scid" ] && continue
+            if [ -n "$scname" ]; then
+                cname="$scname"
+            else
+                cname="$scid"
+            fi
             rec_sh="$BACKUP_DIR/standalone/recreate_${cname}.sh"
             img_tar="$BACKUP_DIR/standalone/image_${cname}.tar"
             if [ ! -f "$rec_sh" ]; then
@@ -1228,42 +1415,105 @@ do_restore() {
         fi
     done < "$BACKUP_DIR/backup_manifest.txt"
 
-    # 2. 确认恢复端所有目标路径真实挂载在外部存储，核查设备、挂载与可用空间，严禁解压到内部 /overlay 或 /
-    log_info "正在预检全部恢复目标的挂载设备、安全与可用空间..."
+    # 2. 确认恢复端所有目标路径真实挂载在外部存储，记录各组件解压所需真实空间并按目标文件系统汇总核验
+    log_info "正在预检全部恢复目标的挂载设备、安全与汇总可用空间..."
     mkdir -p "$TARGET_DATA_ROOT"
-    vol_need_kb=$(du -sk "$BACKUP_DIR/docker_volumes.tar.gz" 2>/dev/null | awk '{print $1}' || echo 0)
-    vol_need_kb=$((vol_need_kb * 2 + 10240))
-    check_mount_safety "$TARGET_DATA_ROOT" "目标 DataRoot 目录" "$vol_need_kb"
     TARGET_DATA_ABS=$(cd "$TARGET_DATA_ROOT" && pwd -P)
 
-    # 预检所有 Compose 项目的目标路径挂载安全性与空间
+    UNCOMP_FILE="$BACKUP_DIR/metadata/uncompressed_sizes.tsv"
+
+    get_uncompressed_kb() {
+        comp_type="$1"
+        key_name="$2"
+        archive_path="$3"
+
+        val=0
+        if [ -f "$UNCOMP_FILE" ]; then
+            bare_key="${key_name%.tar.gz}"
+            val=$(grep -E "^$comp_type	($key_name|$bare_key|${bare_key}.tar.gz)	" "$UNCOMP_FILE" 2>/dev/null | head -n 1 | awk '{print $NF}' || echo 0)
+            case "$val" in ''|*[!0-9]*) val=0 ;; esac
+        fi
+        if [ "$val" -le 0 ] && [ -f "$archive_path" ]; then
+            val=$(tar -tvf "$archive_path" 2>/dev/null | awk '{sum += $3} END {print int(sum/1024)}' || echo 0)
+            case "$val" in ''|*[!0-9]*) val=0 ;; esac
+        fi
+        echo "$val"
+    }
+
+    RESTORE_MNT_REQS="$BACKUP_DIR/metadata/restore_mnt_reqs.tmp"
+    : > "$RESTORE_MNT_REQS"
+
+    # 登记目标 DataRoot 需求
+    vol_uncomp_kb=$(get_uncompressed_kb "volumes" "docker_volumes.tar.gz" "$BACKUP_DIR/docker_volumes.tar.gz")
+    check_mount_safety "$TARGET_DATA_ROOT" "目标 DataRoot 目录" 0
+    df_vol=$(df -P "$TARGET_DATA_ABS" 2>/dev/null || true)
+    m_pt=$(echo "$df_vol" | awk 'NR==2{print $6}')
+    m_dev=$(echo "$df_vol" | awk 'NR==2{print $1}')
+    m_avail=$(echo "$df_vol" | awk 'NR==2{print $4}')
+    echo "$m_pt	$m_dev	$m_avail	$vol_uncomp_kb" >> "$RESTORE_MNT_REQS"
+
+    # 登记各 Compose 项目需求
     if [ -f "$COMPOSE_MANIFEST" ]; then
         while IFS='	' read -r proj_name orig_dir config_file || [ -n "$proj_name" ]; do
             [ -z "$proj_name" ] && continue
             dest_dir=$(resolve_bind_path "$orig_dir")
+            check_mount_safety "$dest_dir" "Compose 项目 [$proj_name] 目标目录 ($orig_dir)" 0
             proj_tar="$BACKUP_DIR/compose/${proj_name}.tar.gz"
-            proj_need_kb=0
-            if [ -f "$proj_tar" ]; then
-                proj_need_kb=$(du -sk "$proj_tar" 2>/dev/null | awk '{print $1}' || echo 0)
-                proj_need_kb=$((proj_need_kb * 2 + 5120))
-            fi
-            check_mount_safety "$dest_dir" "Compose 项目 [$proj_name] 目标目录 ($orig_dir)" "$proj_need_kb"
+            proj_uncomp_kb=$(get_uncompressed_kb "compose" "$proj_name" "$proj_tar")
+            dest_abs=$(cd "$dest_dir" 2>/dev/null || (mkdir -p "$dest_dir" && cd "$dest_dir" && pwd -P))
+            df_proj=$(df -P "$dest_abs" 2>/dev/null || true)
+            p_pt=$(echo "$df_proj" | awk 'NR==2{print $6}')
+            p_dev=$(echo "$df_proj" | awk 'NR==2{print $1}')
+            p_avail=$(echo "$df_proj" | awk 'NR==2{print $4}')
+            echo "$p_pt	$p_dev	$p_avail	$proj_uncomp_kb" >> "$RESTORE_MNT_REQS"
         done < "$COMPOSE_MANIFEST"
     fi
 
-    # 预检所有 Bind Mounts 目标路径挂载安全性与空间
+    # 登记各 Bind Mounts 需求
     if [ -f "$BIND_MANIFEST" ]; then
-        bind_need_kb=0
-        if [ -f "$BACKUP_DIR/docker_bind_mounts.tar.gz" ]; then
-            bind_need_kb=$(du -sk "$BACKUP_DIR/docker_bind_mounts.tar.gz" 2>/dev/null | awk '{print $1}' || echo 0)
-            bind_need_kb=$((bind_need_kb * 2 + 10240))
-        fi
         while IFS= read -r mpath || [ -n "$mpath" ]; do
             [ -z "$mpath" ] && continue
             actual_dest=$(resolve_bind_path "$mpath")
-            check_mount_safety "$actual_dest" "Bind Mount 恢复目标 ($mpath)" "$bind_need_kb"
+            check_mount_safety "$actual_dest" "Bind Mount 恢复目标 ($mpath)" 0
+            bind_uncomp_kb=$(get_uncompressed_kb "bind" "$mpath" "$BACKUP_DIR/docker_bind_mounts.tar.gz")
+            chk_d="$actual_dest"
+            while [ ! -d "$chk_d" ] && [ "$chk_d" != "/" ] && [ "$chk_d" != "." ]; do
+                p_d=$(dirname "$chk_d")
+                [ "$p_d" = "$chk_d" ] && break
+                chk_d="$p_d"
+            done
+            b_abs=$(cd "$chk_d" && pwd -P)
+            df_b=$(df -P "$b_abs" 2>/dev/null || true)
+            b_pt=$(echo "$df_b" | awk 'NR==2{print $6}')
+            b_dev=$(echo "$df_b" | awk 'NR==2{print $1}')
+            b_avail=$(echo "$df_b" | awk 'NR==2{print $4}')
+            echo "$b_pt	$b_dev	$b_avail	$bind_uncomp_kb" >> "$RESTORE_MNT_REQS"
         done < "$BIND_MANIFEST"
     fi
+
+    # 按目标文件系统挂载点 (m_pt) 汇总空间需求并核验
+    awk -F'\t' '{
+        pt = $1;
+        dev[pt] = $2;
+        avail[pt] = $3;
+        sum_need[pt] += $4;
+    } END {
+        for (pt in sum_need) {
+            printf "%s\t%s\t%s\t%s\n", pt, dev[pt], avail[pt], sum_need[pt];
+        }
+    }' "$RESTORE_MNT_REQS" | while IFS='	' read -r c_pt c_dev c_avail c_sum_need || [ -n "$c_pt" ]; do
+        [ -z "$c_pt" ] && continue
+        case "$c_avail" in ''|*[!0-9]*) c_avail=0 ;; esac
+        case "$c_sum_need" in ''|*[!0-9]*) c_sum_need=0 ;; esac
+        total_need=$((c_sum_need + 10240))
+        if [ "$c_avail" -lt "$total_need" ]; then
+            log_error "目标挂载点 $c_pt (设备: $c_dev) 存储空间不足！全部恢复组件展开汇总所需: ${total_need}KB (包含展开数据 ${c_sum_need}KB + 冗余 10240KB)，当前可用: ${c_avail}KB"
+            rm -f "$RESTORE_MNT_REQS"
+            exit 1
+        fi
+        log_info "目标挂载点 $c_pt 容量安全核验通过: 汇总展开所需 ${total_need}KB <= 可用 ${c_avail}KB"
+    done
+    rm -f "$RESTORE_MNT_REQS"
 
     # 3. 恢复前确认 dockerd 已停止
     INIT_DOCKERD="$(get_sys_path /etc/init.d/dockerd)"
@@ -1562,77 +1812,118 @@ do_verify_runtime() {
             SOCKS_PORT=""
             VALID_JSON=1
 
+            # 1. 查找运行进程实际命令行与对应的配置文件路径（支持 ACL 子目录与任意指定配置）
+            CANDIDATE_CONFIGS=""
+            PW_PIDS=$(pgrep -x "$PW_CORE" 2>/dev/null || pgrep "$PW_CORE" 2>/dev/null || pidof "$PW_CORE" 2>/dev/null || true)
+            for p_id in $PW_PIDS; do
+                cmd_file="$(get_sys_path /proc)/$p_id/cmdline"
+                [ ! -f "$cmd_file" ] && cmd_file="/proc/$p_id/cmdline"
+                if [ -f "$cmd_file" ]; then
+                    p_args=$(tr '\0' '\n' < "$cmd_file" 2>/dev/null || true)
+                    for pa in $p_args; do
+                        case "$pa" in
+                            *.json)
+                                real_cfg=$(get_sys_path "$pa")
+                                [ -f "$real_cfg" ] && CANDIDATE_CONFIGS="$CANDIDATE_CONFIGS $real_cfg"
+                                ;;
+                        esac
+                    done
+                fi
+            done
+
+            # 2. 辅以 ps 输出解析命令行中的 .json 配置文件路径
+            if command -v ps >/dev/null 2>&1; then
+                ps_lines=$(ps -w 2>/dev/null | grep -E "$PW_CORE" | grep -oE "(/[^[:space:]]+\.json)" || true)
+                for pl in $ps_lines; do
+                    real_cfg=$(get_sys_path "$pl")
+                    [ -f "$real_cfg" ] && CANDIDATE_CONFIGS="$CANDIDATE_CONFIGS $real_cfg"
+                done
+            fi
+
+            # 3. 辅以 /var/etc/passwall2 目录下（含 ACL 子目录及所有深层子目录）所有 JSON 文件的递归扫描
             if [ -d "$VAR_PW_DIR" ]; then
-                for cfg in "$VAR_PW_DIR"/*.json; do
-                    [ -f "$cfg" ] || continue
-                    # 校验 JSON 语法
+                pw_all_json=$(find "$VAR_PW_DIR" -type f -name "*.json" 2>/dev/null || true)
+                for f_cfg in $pw_all_json; do
+                    CANDIDATE_CONFIGS="$CANDIDATE_CONFIGS $f_cfg"
+                done
+            fi
+
+            # 逐一校验候选配置并提取 inbounds SOCKS 本地监听端口
+            CHECKED_FILES=""
+            for cfg in $CANDIDATE_CONFIGS; do
+                [ -f "$cfg" ] || continue
+                case " $CHECKED_FILES " in
+                    *" $cfg "*) continue ;;
+                esac
+                CHECKED_FILES="$CHECKED_FILES $cfg"
+
+                # 校验 JSON 语法
+                if command -v jq >/dev/null 2>&1; then
+                    if ! jq empty "$cfg" >/dev/null 2>&1; then
+                        log_error "PassWall2 核心配置文件语法异常 ($cfg)！"
+                        VALID_JSON=0
+                    fi
+                fi
+                if [ -z "$SOCKS_PORT" ]; then
                     if command -v jq >/dev/null 2>&1; then
-                        if ! jq empty "$cfg" >/dev/null 2>&1; then
-                            log_error "PassWall2 核心配置文件语法异常 ($cfg)！"
-                            VALID_JSON=0
-                        fi
+                        SOCKS_PORT=$(jq -r '.inbounds[]? | select((.protocol? == "socks") or (.type? == "socks") or ((.tag? // "") | test("socks"; "i"))) | (.listen_port // .port // empty)' "$cfg" 2>/dev/null | head -n 1 || true)
                     fi
                     if [ -z "$SOCKS_PORT" ]; then
-                        if command -v jq >/dev/null 2>&1; then
-                            SOCKS_PORT=$(jq -r '.inbounds[]? | select((.protocol? == "socks") or (.type? == "socks") or ((.tag? // "") | test("socks"; "i"))) | (.listen_port // .port // empty)' "$cfg" 2>/dev/null | head -n 1 || true)
-                        fi
-                        if [ -z "$SOCKS_PORT" ]; then
-                            # 使用 awk 严格在 inbounds 节区内提取 socks 监听端口，杜绝截取 outbounds 远程服务器端口（支持嵌套对象与 port/protocol 任意出现顺序）
-                            SOCKS_PORT=$(awk '
-                                BEGIN {
-                                    in_inb = 0
-                                    brace_depth = 0
+                        # 使用 awk 严格在 inbounds 节区内提取 socks 监听端口，杜绝截取 outbounds 远程服务器端口（支持嵌套对象与 port/protocol 任意出现顺序）
+                        SOCKS_PORT=$(awk '
+                            BEGIN {
+                                in_inb = 0
+                                brace_depth = 0
+                                curr_port = ""
+                                is_socks = 0
+                            }
+                            /"inbounds"[[:space:]]*:/ {
+                                in_inb = 1
+                            }
+                            in_inb {
+                                n_open = split($0, d1, /\{/) - 1
+                                n_close = split($0, d2, /\}/) - 1
+
+                                if (brace_depth > 0 || n_open > 0) {
+                                    if ($0 ~ /"(protocol|type)"[[:space:]]*:[[:space:]]*"socks"/ || $0 ~ /"tag"[[:space:]]*:[[:space:]]*"[^"]*socks[^"]*"/) {
+                                        is_socks = 1
+                                    }
+                                    if ($0 ~ /"(listen_port|port)"[[:space:]]*:[[:space:]]*[0-9]+/) {
+                                        match($0, /"(listen_port|port)"[[:space:]]*:[[:space:]]*[0-9]+/)
+                                        if (RLENGTH > 0) {
+                                            str = substr($0, RSTART, RLENGTH)
+                                            split(str, arr, ":")
+                                            gsub(/[[:space:]]/, "", arr[2])
+                                            curr_port = arr[2]
+                                        }
+                                    }
+                                }
+
+                                if (brace_depth == 0 && n_open > 0) {
+                                    brace_depth += n_open
+                                    brace_depth -= n_close
+                                } else if (brace_depth > 0) {
+                                    brace_depth += n_open
+                                    brace_depth -= n_close
+                                }
+
+                                if (brace_depth == 0 && (n_open > 0 || n_close > 0)) {
+                                    if (is_socks == 1 && curr_port != "") {
+                                        print curr_port
+                                        exit
+                                    }
                                     curr_port = ""
                                     is_socks = 0
                                 }
-                                /"inbounds"[[:space:]]*:/ {
-                                    in_inb = 1
+
+                                if (brace_depth == 0 && $0 ~ /\]/) {
+                                    in_inb = 0
                                 }
-                                in_inb {
-                                    n_open = split($0, d1, /\{/) - 1
-                                    n_close = split($0, d2, /\}/) - 1
-
-                                    if (brace_depth > 0 || n_open > 0) {
-                                        if ($0 ~ /"(protocol|type)"[[:space:]]*:[[:space:]]*"socks"/ || $0 ~ /"tag"[[:space:]]*:[[:space:]]*"[^"]*socks[^"]*"/) {
-                                            is_socks = 1
-                                        }
-                                        if ($0 ~ /"(listen_port|port)"[[:space:]]*:[[:space:]]*[0-9]+/) {
-                                            match($0, /"(listen_port|port)"[[:space:]]*:[[:space:]]*[0-9]+/)
-                                            if (RLENGTH > 0) {
-                                                str = substr($0, RSTART, RLENGTH)
-                                                split(str, arr, ":")
-                                                gsub(/[[:space:]]/, "", arr[2])
-                                                curr_port = arr[2]
-                                            }
-                                        }
-                                    }
-
-                                    if (brace_depth == 0 && n_open > 0) {
-                                        brace_depth += n_open
-                                        brace_depth -= n_close
-                                    } else if (brace_depth > 0) {
-                                        brace_depth += n_open
-                                        brace_depth -= n_close
-                                    }
-
-                                    if (brace_depth == 0 && (n_open > 0 || n_close > 0)) {
-                                        if (is_socks == 1 && curr_port != "") {
-                                            print curr_port
-                                            exit
-                                        }
-                                        curr_port = ""
-                                        is_socks = 0
-                                    }
-
-                                    if (brace_depth == 0 && $0 ~ /\]/) {
-                                        in_inb = 0
-                                    }
-                                }
-                            ' "$cfg" 2>/dev/null || true)
-                        fi
+                            }
+                        ' "$cfg" 2>/dev/null || true)
                     fi
-                done
-            fi
+                fi
+            done
 
             if [ "$VALID_JSON" -ne 1 ]; then
                 FAILED=1
@@ -1693,7 +1984,7 @@ do_verify_runtime() {
             RULESET=$(nft list ruleset 2>/dev/null || nft list tables 2>/dev/null || true)
             if echo "$RULESET" | grep -q "flowtable"; then
                 HAS_SW_FLOWTABLE=1
-                if echo "$RULESET" | grep -qE "flags[[:space:]]*=[[:space:]]*\{[[:space:]]*hw_offload[[:space:]]*\}|hw_offload"; then
+                if echo "$RULESET" | grep -qE "flags[[:space:]]+offload|flags[[:space:]]*=[[:space:]]*\{?[[:space:]]*(hw_offload|offload)[[:space:]]*\}?|hw_offload"; then
                     HAS_HW_OFFLOAD=1
                 fi
             fi

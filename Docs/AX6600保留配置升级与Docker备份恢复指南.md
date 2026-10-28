@@ -19,20 +19,32 @@ cat /tmp/sysinfo/model 2>/dev/null || cat /proc/device-tree/model 2>/dev/null
 
 ### 2. 目标升级分区与容量核查（严格遵循 BOOTCONFIG 判定机制，严禁 60MB 原厂分区刷入 PLUS）
 雅典娜采用 eMMC 双系统分区设计（内核为 `0:HLOS`/`0:HLOS_1`，根文件系统为 `rootfs`/`rootfs_1`）。OpenWrt 平台的 `sysupgrade`（`platform.sh`）通过读取 `0:BOOTCONFIG` 分区第 148 字节标记确定目标写入分区：
-- 标记为 `1`：写入 `0:HLOS_1`（内核）与 `rootfs_1`（根文件系统）；
-- 标记为 `0`：写入 `0:HLOS`（内核）与 `rootfs`（根文件系统）；
-- 若 BOOTCONFIG 读取受阻，则回退读取 `/proc/cmdline` 的 `root=` 参数反推对侧分区。
+- 标记为 `1`：写入对侧 `0:HLOS_1`（内核）与 `rootfs_1`（根文件系统）；
+- 标记为 `0`：写入对侧 `0:HLOS`（内核）与 `rootfs`（根文件系统）；
+- **严格判定原则**：若 `0:BOOTCONFIG` 缺失或读取失败，辅助工具及升级流程将**立即严格报错退出**，绝不盲猜分区、绝不在双分区中误取较小分区；若待写入的目标对侧分区（如 `0:HLOS_1` 或 `rootfs_1`）不存在，严禁向同名或非目标分区借用扇区容量，必须即刻阻断。
 
 ```bash
 # 1. 查看 BOOTCONFIG 分区偏移 148 字节标记（确定主备切换目标）
 hexdump -e '1/1 "%01x|"' -n 1 -s 148 -C /dev/disk/by-partlabel/0:BOOTCONFIG 2>/dev/null || od -An -tx1 -N 1 -j 148 /dev/mmcblk0p2
 
-# 2. 查看 eMMC 分区表及目标内核与根文件系统分区扇区容量
-fdisk -l /dev/mmcblk0 | grep -E "0:BOOTCONFIG|0:HLOS|rootfs"
+# 2. 查看 eMMC 分区表及实际分区名称与扇区容量
+# 注：util-linux 标准 fdisk -l 在 GPT 下不输出 Name 列，系统内核 sysfs 是最权威的数据源：
+for u in /sys/class/block/mmcblk0p*/uevent; do
+    [ -f "$u" ] || continue
+    pname=$(grep '^PARTNAME=' "$u" | cut -d= -f2)
+    pdev=$(grep '^DEVNAME=' "$u" | cut -d= -f2)
+    psize=$(cat "/sys/class/block/$pdev/size" 2>/dev/null || echo 0)
+    psize_mb=$(( psize * 512 / 1024 / 1024 ))
+    echo "设备: /dev/$pdev, 分区名: $pname, 扇区: $psize (${psize_mb} MB)"
+done | grep -E "0:BOOTCONFIG|0:HLOS|rootfs"
+
+# 3. 提取固件包内实际 kernel 与 root 字节大小（sysupgrade 格式 tar 包预检）
+tar -tvf /tmp/ones20250-owrt-plus-*.bin 2>/dev/null | grep -E "kernel|root"
 ```
 - **容量红线判定**：
-  - 本次 PLUS 完整升级包约为 **152.04 MB**（解压刷入需占用对应分区大小）。
-  - 为保证系统启动后有足够的内部临时存储空间，待升级目标根文件系统分区必须 **大于 200 MB**（如扩容后的 512MB 或 1024MB 分区），目标内核分区需大于 4MB。
+  - 本次 PLUS 完整升级包约为 **152.04 MB**（解压后实际 `root` 镜像约 130-150MB，`kernel` 约 4-6MB）。
+  - 辅助工具在预检时会解包分析固件内部 `kernel` 和 `root` 的精确字节数，比对目标分区可用容量，且要求目标 rootfs 分区在承载固件解压后必须保留至少 **50 MB** 的内部 overlay 存储空间；
+  - 为保证系统启动后有足够的内部临时存储空间，待升级目标根文件系统分区必须 **大于 200 MB**（如扩容后的 512MB 或 1024MB 分区），目标内核分区需大于 6MB。
   - 若待升级的对侧分区仅为 **60 MB**（未扩容的原厂双分区状态），**严禁刷入 PLUS 版**（会导致分区溢出变砖！），请先选择 30MB 的 `PURE` 纯净版，或使用 U-Boot 重新刷入扩容分区表。
   - **重要原则**：绝不能根据整机 64GB/128GB eMMC 的总存储容量来判断能否刷入，必须精确核对待写入的目标分区实际大小；双分区机型绝不能盲目取两者中较大的一个。
 
@@ -110,16 +122,17 @@ docker exec <postgres_container> pg_dumpall -U postgres > /mnt/sda1/postgres_all
 docker exec <redis_container> redis-cli SAVE
 ```
 
-### 2. 停机顺序与影响说明
-1. **影响**：停用容器与 dockerd 后，基于 Docker 运行的服务（如本地内网穿透、自建 DNS、媒体库等）将暂时下线；
-2. **操作顺序**：
-   - 步骤 ①：导出容器清单、inspect 元数据与 Compose 目录（含 `.env` 配置文件）；
-   - 步骤 ②：完成数据库应用级一致性导出；
+### 2. 停机顺序与一致性保障说明
+1. **业务影响**：停用容器与 dockerd 后，基于 Docker 运行的服务（如本地内网穿透、自建 DNS、媒体库等）将暂时下线；
+2. **严格操作时序**：
+   - 步骤 ①：导出容器清单、inspect 元数据与 Compose 目录（含 `.env` 配置文件）；在修改任何服务状态前先预检独立容器参数合法性，遇到多网络/依赖容器等无法单命令还原的配置时提前明确阻断；
+   - 步骤 ②：完成数据库应用级一致性热备（MySQL / MariaDB / Postgres / Redis 转储）；
    - 步骤 ③：**临时禁用 dockerd 开机自启动**（避免升级首次开机在外盘未就绪时误在空目录初始化）；
-   - 步骤 ④：停止运行中的所有业务容器（保证存储块冷备一致性）；
-   - 步骤 ⑤：停止 dockerd 守护进程；
-   - 步骤 ⑥：打包归档 Named Volumes、Bind Mounts 与可写层快照；
-   - 步骤 ⑦：生成 SHA256 校验和清单，并进行归档可读性验证。
+   - 步骤 ④：**优雅停止运行中的所有业务容器**（`docker stop`，使容器内进程正常关机并完成数据完全落盘）；
+   - 步骤 ⑤：**提交并导出独立容器镜像快照**（在容器停机后执行 `docker commit` 与 `docker save`，保证停机刷盘的数据完整写入镜像），同时生成带完整单引号安全转义的独立容器重建脚本；
+   - 步骤 ⑥：**停止 dockerd 守护进程**（`/etc/init.d/dockerd stop`）；
+   - 步骤 ⑦：打包归档 Named Volumes、各 Compose 项目工作目录与 Bind Mounts 目录，同时将各组件解压所需空间精确记录至 `metadata/uncompressed_sizes.tsv` 与 `backup_manifest.txt`；
+   - 步骤 ⑧：生成全局校验清单 `sha256sums.txt`（通过隐藏临时文件严格排除自身与清单文件，杜绝哈希污染），并在完成打包后立即在原地执行 `sha256sum -c sha256sums.txt` 严密自检，确保归档未发生位翻转或损坏。
 
 ### 3. 使用辅助脚本执行自动化备份
 项目提供了完善的 POSIX 兼容辅助工具 `Scripts/docker_upgrade_helper.sh`：
@@ -134,10 +147,11 @@ chmod +x /tmp/docker_upgrade_helper.sh
 - 探测并安全核对 `DockerRootDir` 挂载介质（拒绝 `/overlay` 和 `/tmp` 目标）；
 - 导出各 Compose 项目配置文件（包括隐藏 `.env` 文件）；
 - 自动检测 MySQL/MariaDB/Postgres 容器并执行一致性 dump；
-- 对有变动的独立容器提交快照镜像并生成重建命令；
+- 对有变动的独立容器在停机落盘后提交快照镜像并生成重建命令；
 - 记录 Docker 原自启状态，升级前临时禁用自启动；
 - 优雅停止容器与 dockerd 服务；
-- 打包 Named Volumes 与宿主 Bind Mounts，生成 `sha256sums.txt`；
+- 打包 Named Volumes 与宿主 Bind Mounts，记录解压空间并生成 `sha256sums.txt` 与 `backup_manifest.txt`；
+- 执行就地校验和自检；
 - 自动将恢复辅助脚本复制一份至备份介质根目录，确保重启后脱机可用。
 
 ### 4. 远程 SSH 流式备份至电脑（无路由器外挂盘时的方案）
@@ -237,13 +251,13 @@ df -h | grep /mnt/sda1 || mount /mnt/sda1
     --target-data-root /mnt/sda1/docker_data
 ```
 还原流程包括：
-- 严格校验全局 `sha256sums.txt`、`backup_manifest.txt` 完整清单与所有备份组件（包括独立容器镜像归档与重建脚本、Compose 归档、Volumes 归档、Bind 归档及数据库转储），确保所有归档、脚本与配置无缺漏、未发生位翻转或损坏，任一缺失即刻阻断；
-- 预先核验所有恢复目标（DataRoot、Compose 目标目录、Bind Mounts 目标目录）的挂载安全性、所属存储设备与可用存储空间（确保空间满足各归档解压与冗余需求），严禁任何未挂载外部盘的目标写入内部 `/overlay` 或 `/`；
+- **完整性双重验证**：严格校验全局 `sha256sums.txt`、`backup_manifest.txt` 清单与所有备份组件（包括独立容器镜像归档与重建脚本、Compose 归档、Volumes 归档、Bind 归档及数据库转储），任一文件缺失或哈希不匹配即刻阻断；
+- **文件系统挂载点聚合容量校验**：通过 `df -P` 精准识别 DataRoot、各 Compose 项目目标目录、各 Bind Mounts 目标目录分别归属的文件系统挂载点；若多个组件恢复至同一存储分区，脚本会自动聚合累加所有组件的**实际解压后体积**（读取 `metadata/uncompressed_sizes.tsv`），并校验该挂载点可用空间满足 `总解压需求 + 10MB` 冗余缓冲，严禁未挂载或空间不足时写入；
 - 恢复 `/etc/config/dockerd` 与 `/etc/docker/daemon.json` 配置，自动同步更新 `data_root` 路径；
-- 按照安全解压时序：先释放 Compose 编排目录结构，后解压释放 Bind Mounts 与 Named Volumes，确保冷备持久化数据绝对权威，绝不被 Compose 目录内的旧归档覆盖；
+- **防覆盖安全解压时序**：先释放 Compose 编排目录结构，后解压释放 Bind Mounts 与 Named Volumes，确保冷备持久化数据绝对权威，绝不被 Compose 目录内的旧归档覆盖；
 - 启动 dockerd 守护进程并按原有状态恢复开机自启；
 - 仅拉起本次升级记录的 Compose 编排项目（严格使用记录的项目名 `-p`、配置文件 `-f` 与 `--env-file`）；
-- 按完整配置参数（环境变量 `-e`、端口映射 `-p`、数据挂载 `-v`、网络模式 `--net`、重启策略 `--restart`、特权 `--privileged`、用户 `-u`、工作目录 `-w`、主机名 `-h`、入口点 `--entrypoint`、设备 `--device`、权限 `--cap-add`/`--cap-drop`、DNS `--dns`、启动命令与参数）安全单引号转义重建独立容器，并自动通过 `docker load` 恢复本地导出的镜像；
+- **参数完备的独立容器重建**：完整支持环境变量 `-e`、端口映射 `-p`、数据卷 `-v`、高级挂载 `--mount`（bind/volume/tmpfs 完整解析）、网络模式 `--net`、重启策略 `--restart`、特权 `--privileged`、运行用户 `-u`、工作目录 `-w`、主机名 `-h`、多段入口点 `--entrypoint` 与跟随参数、设备映射 `--device`、权限控制 `--cap-add`/`--cap-drop`、DNS `--dns` 以及命令与参数，所有参数经单引号安全转义；在无网络脱机环境下通过 `docker load` 自动导入导出的本地镜像；
 - 若存在 SQL 备份文件，按需导入对应数据库。
 
 ---
@@ -277,10 +291,18 @@ uci show passwall2 | grep -E "\.type=|\.protocol=|\.address=|\.port="
 # 确认核心进程处于运行状态
 pgrep -x sing-box || pgrep -x xray
 
-# 检查实际生成的 JSON 客户端配置语法
-for cfg in /var/etc/passwall2/*.json; do
+# 动态反查运行中核心进程的真实命令行参数与配置文件位置（解析 /proc/<pid>/cmdline 与 ps -w）
+CORE_PIDS=$(pgrep -x sing-box || true; pgrep -x xray || true)
+for pid in $CORE_PIDS; do
+    [ -n "$pid" ] || continue
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || ps -w 2>/dev/null | grep "^[ ]*$pid " || true)
+    echo "进程 PID $pid 命令行: $cmdline"
+done
+
+# 递归检查生成的 JSON 客户端配置语法（覆盖 /var/etc/passwall2 及其 ACL/ 等所有子目录）
+find /var/etc/passwall2 -type f -name "*.json" 2>/dev/null | while read -r cfg; do
     [ -f "$cfg" ] || continue
-    if command -v jq >/dev/null; then
+    if command -v jq >/dev/null 2>&1; then
         jq empty "$cfg" && echo "配置语法验证通过: $cfg"
     fi
 done
@@ -292,9 +314,9 @@ done
 
 必须通过指定本地 SOCKS 端口进行带 TLS 握手的 HTTPS 深度请求与出口 IP 核验：
 ```bash
-# 1. 自动定位活动核心的实际本地 SOCKS 监听端口（严格解析 inbounds，杜绝截取 outbounds 远程端口或盲猜 1080）
+# 1. 自动定位活动核心的实际本地 SOCKS 监听端口（先查运行进程 cmdline，再查 JSON 的 inbounds 节区，包含 ACL/ 子目录，杜绝截取 outbounds 远程端口或盲猜 1080）
 SOCKS_PORT=""
-for cfg in /var/etc/passwall2/*.json; do
+find /var/etc/passwall2 -type f -name "*.json" 2>/dev/null | while read -r cfg; do
     [ -f "$cfg" ] || continue
     if command -v jq >/dev/null 2>&1; then
         SOCKS_PORT=$(jq -r '.inbounds[]? | select((.protocol? == "socks") or (.type? == "socks") or ((.tag? // "") | test("socks"; "i"))) | (.listen_port // .port // empty)' "$cfg" 2>/dev/null | head -n 1)
@@ -302,7 +324,7 @@ for cfg in /var/etc/passwall2/*.json; do
     if [ -z "$SOCKS_PORT" ]; then
         SOCKS_PORT=$(sed -n '/"inbounds"/,/"outbounds"/p' "$cfg" | grep -oE '"(listen_port|port)": *[0-9]+' | head -n 1 | awk '{print $2}')
     fi
-    [ -n "$SOCKS_PORT" ] && break
+    [ -n "$SOCKS_PORT" ] && echo "$SOCKS_PORT" && break
 done
 echo "PassWall2 活动核心 SOCKS 本地监听端口: $SOCKS_PORT"
 
@@ -324,11 +346,11 @@ logread -e passwall2 | tail -n 25
 ### 2. 软硬件加速与 PPE Flowtable 硬件卸载核对
 
 > [!WARNING]
-> 单纯在 nftables 中存在 `flowtable` 仅代表开启了**软件流表卸载**；Qualcomm PPE 硬件加速必须确认 flowtable 规则中包含 `flags = { hw_offload }` 硬件标志，且内核驱动未出现 probe failed。
+> 单纯在 nftables 中存在 `flowtable` 仅代表开启了**软件流表卸载**；Qualcomm PPE 硬件加速必须确认 flowtable 规则中包含 `flags offload;` 或 `flags = { hw_offload }` 硬件标志，且内核驱动未出现 probe failed。
 
 ```bash
-# 1. 验证内核 Flowtable 流表是否包含硬件卸载标志 hw_offload
-nft list ruleset | grep -qE "flags[[:space:]]*=[[:space:]]*\{[[:space:]]*hw_offload[[:space:]]*\}|hw_offload" && echo "PPE 硬件卸载标志: 已生效" || echo "警告: 仅为软件 Flowtable，缺少 hw_offload 硬件标志"
+# 1. 验证内核 Flowtable 流表是否包含硬件卸载标志 flags offload; 或 hw_offload
+nft list ruleset | grep -qE "flags[[:space:]]+offload;|flags[[:space:]]*=[[:space:]]*\{[[:space:]]*hw_offload[[:space:]]*\}|hw_offload" && echo "PPE 硬件卸载标志: 已生效" || echo "警告: 仅为软件 Flowtable，缺少 hw_offload/flags offload; 硬件标志"
 
 # 2. 检查内核日志是否存在 PPE 驱动初始化或探测失败
 dmesg | grep -qiE "(ppe|flowtable|qcom-ppe).*(fail|error|disabled)" && echo "警告: PPE 驱动探测或初始化存在报错！" || echo "PPE 驱动就绪: 无报错"

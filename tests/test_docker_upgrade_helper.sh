@@ -74,7 +74,24 @@ case "$cmd" in
         if [ "${1:-}" = "-f" ]; then
             fmt="$2"
             cid="$3"
+            if [ -n "$cid" ]; then
+                for cname_file in "$MOCK_STATE"/cname_*; do
+                    if [ -f "$cname_file" ]; then
+                        stored_name=$(cat "$cname_file" 2>/dev/null | tr -d '/')
+                        if [ "$stored_name" = "$cid" ] || [ "/$stored_name" = "$cid" ]; then
+                            cid=$(basename "$cname_file" | sed 's/^cname_//')
+                            break
+                        fi
+                    fi
+                done
+            fi
             case "$fmt" in
+                *".Id"*|*"Id"*)
+                    echo "$cid"
+                    ;;
+                *"HostConfig.Mounts"*)
+                    cat "$MOCK_STATE/cmounts_$cid" 2>/dev/null || true
+                    ;;
                 *"Labels"*"com.docker.compose.project.working_dir"*)
                     cat "$MOCK_STATE/comp_workdir_$cid" 2>/dev/null || true
                     ;;
@@ -401,7 +418,7 @@ cat << 'EOF' > "$MOCK_BIN/nft"
 #!/bin/sh
 echo "nft $*" >> "$MOCK_STATE/invocations.log"
 if [ -f "$MOCK_STATE/nft_has_flowtable_hw" ]; then
-    echo "table inet fw4 { flowtable ft { hook ingress priority 0; devices = { eth0 }; flags = { hw_offload }; } }"
+    echo "table inet fw4 { flowtable ft { hook ingress priority 0; devices = { eth0 }; flags offload; } }"
 elif [ -f "$MOCK_STATE/nft_has_flowtable_sw" ] || [ -f "$MOCK_STATE/nft_has_flowtable" ]; then
     echo "table inet fw4 { flowtable ft { hook ingress priority 0; devices = { eth0 }; } }"
 else
@@ -464,7 +481,7 @@ echo "pgrep $*" >> "$MOCK_STATE/invocations.log"
 target="$1"
 [ "$target" = "-x" ] && target="$2"
 if [ -f "$MOCK_STATE/pgrep_running_$target" ]; then
-    echo "12345"
+    cat "$MOCK_STATE/pgrep_pid_$target" 2>/dev/null || echo "12345"
     exit 0
 fi
 exit 1
@@ -1841,4 +1858,367 @@ echo "--- 测试 15: 独立容器高级特性与不可还原配置备份阻断 -
 )
 echo "PASS: 测试 15 通过（Links、VolumesFrom、container 模式与自定义运行时均在备份阶段被成功阻断）"
 
-echo "=== 全部 15 项深度隔离测试与回归演练已通过！ ==="
+# -----------------------------------------------------------------------------
+# 测试 16: sha256sums.txt 严格自排除与生成时就地自校验
+# -----------------------------------------------------------------------------
+echo "--- 测试 16: sha256sums.txt 严格自排除与就地自校验 ---"
+(
+    T16_DOCKER="$TEST_SANDBOX/t16_docker"
+    T16_TARGET="$TEST_SANDBOX/t16_target"
+    mkdir -p "$T16_DOCKER/volumes" "$T16_TARGET"
+    echo "$T16_DOCKER" > "$MOCK_STATE/docker_root_dir"
+
+    echo "dummy_vol_data" > "$T16_DOCKER/volumes/data.txt"
+
+    sh "$HELPER_SCRIPT" backup \
+        --docker-dir "$T16_DOCKER" \
+        --target-dir "$T16_TARGET" \
+        --sys-root "$SYS_ROOT" \
+        --skip-stop >/dev/null
+
+    # 16a: 校验清单中严禁包含 sha256sums.txt 自身及隐藏临时文件
+    if grep -q "sha256sums\.txt" "$T16_TARGET/sha256sums.txt"; then
+        echo "FAIL: sha256sums.txt 包含自身哈希记录，存在哈希自引用污染！"
+        exit 1
+    fi
+    if grep -q "\.sha256sums\.tmp" "$T16_TARGET/sha256sums.txt"; then
+        echo "FAIL: sha256sums.txt 包含了隐藏临时文件 .sha256sums.tmp！"
+        exit 1
+    fi
+
+    # 16b: backup_manifest.txt 必须被包含在校验清单中
+    if ! grep -q "backup_manifest\.txt" "$T16_TARGET/sha256sums.txt"; then
+        echo "FAIL: backup_manifest.txt 未被纳入 sha256sums.txt 校验！"
+        exit 1
+    fi
+
+    # 16c: 原地哈希自校验必须全量通过
+    (cd "$T16_TARGET" && sha256sum -c sha256sums.txt >/dev/null 2>&1) || {
+        echo "FAIL: 备份生成的 sha256sums.txt 原地自校验未通过！"
+        exit 1
+    }
+)
+echo "PASS: 测试 16 通过（sha256sums.txt 严格自排除并全量通过就地自检）"
+
+# -----------------------------------------------------------------------------
+# 测试 17: 独立容器停机与快照顺序反例演练（停机后 commit/save 捕获落盘数据）
+# -----------------------------------------------------------------------------
+echo "--- 测试 17: 独立容器停机与快照顺序反例演练 ---"
+(
+    T17_DOCKER="$TEST_SANDBOX/t17_docker"
+    T17_TARGET="$TEST_SANDBOX/t17_target"
+    mkdir -p "$T17_DOCKER/volumes" "$T17_TARGET"
+    echo "$T17_DOCKER" > "$MOCK_STATE/docker_root_dir"
+
+    echo "c_flush_cid" > "$MOCK_STATE/containers_list_ids"
+    echo "c_flush" > "$MOCK_STATE/cname_c_flush_cid"
+    echo "alpine:latest" > "$MOCK_STATE/cimg_c_flush_cid"
+    echo "C /data_flush.txt" > "$MOCK_STATE/diff_c_flush_cid"
+
+    # 清空调用日志
+    : > "$MOCK_STATE/invocations.log"
+
+    sh "$HELPER_SCRIPT" backup \
+        --docker-dir "$T17_DOCKER" \
+        --target-dir "$T17_TARGET" \
+        --sys-root "$SYS_ROOT" >/dev/null
+
+    rm -f "$MOCK_STATE/containers_list_ids" "$MOCK_STATE/diff_c_flush_cid"
+
+    # 验证 docker stop 出现在 docker commit 之前
+    STOP_LINE=$(grep -n "docker stop.*c_flush" "$MOCK_STATE/invocations.log" 2>/dev/null | head -n 1 | cut -d: -f1 || echo 0)
+    COMMIT_LINE=$(grep -n "docker commit.*c_flush" "$MOCK_STATE/invocations.log" 2>/dev/null | head -n 1 | cut -d: -f1 || echo 0)
+    SAVE_LINE=$(grep -n "docker save.*c_flush" "$MOCK_STATE/invocations.log" 2>/dev/null | head -n 1 | cut -d: -f1 || echo 0)
+
+    if [ "$STOP_LINE" -eq 0 ]; then
+        echo "FAIL: 备份期间未调用 docker stop 停止容器！"
+        exit 1
+    fi
+    if [ "$COMMIT_LINE" -eq 0 ] || [ "$SAVE_LINE" -eq 0 ]; then
+        echo "FAIL: 备份期间未调用 docker commit/save 导出容器快照！"
+        exit 1
+    fi
+    if [ "$STOP_LINE" -ge "$COMMIT_LINE" ]; then
+        echo "FAIL: docker commit 在 docker stop 之前被调用！停机刷盘数据未能被捕获到镜像快照中！"
+        exit 1
+    fi
+)
+echo "PASS: 测试 17 通过（容器关机落盘在 commit/save 快照之前执行，脏数据完全落盘）"
+
+# -----------------------------------------------------------------------------
+# 测试 18: 独立容器高级 --mount (bind & volume) 与多段 Entrypoint 命令安全解析与重建
+# -----------------------------------------------------------------------------
+echo "--- 测试 18: 独立容器高级 --mount 与多段 Entrypoint 重建 ---"
+(
+    T18_DOCKER="$TEST_SANDBOX/t18_docker"
+    T18_TARGET="$TEST_SANDBOX/t18_target"
+    mkdir -p "$T18_DOCKER/volumes" "$T18_TARGET"
+    echo "$T18_DOCKER" > "$MOCK_STATE/docker_root_dir"
+
+    echo "c_adv_cid" > "$MOCK_STATE/containers_list_ids"
+    echo "c_adv" > "$MOCK_STATE/cname_c_adv_cid"
+    echo "alpine:latest" > "$MOCK_STATE/cimg_c_adv_cid"
+
+    # 准备 bind 宿主目录 (必须存在，否则停机前校验会拦截)
+    T18_ROUTER_BIND="/t18_host_data"
+    T18_HOST_BIND="$SYS_ROOT$T18_ROUTER_BIND"
+    mkdir -p "$T18_HOST_BIND"
+
+    # 设置 HostConfig.Mounts: 一个 bind 挂载，一个 volume 挂载
+    printf 'bind|%s|/container_data|false\nvolume|my_data_vol|/vol_data|false\n' "$T18_ROUTER_BIND" > "$MOCK_STATE/cmounts_c_adv_cid"
+
+    # 设置多参数 Entrypoint: /bin/sh -c
+    printf '/bin/sh\n-c\n' > "$MOCK_STATE/centrypoint_c_adv_cid"
+    printf 'echo\nhello_ax6600\n' > "$MOCK_STATE/ccmd_c_adv_cid"
+
+    sh "$HELPER_SCRIPT" backup \
+        --docker-dir "$T18_DOCKER" \
+        --target-dir "$T18_TARGET" \
+        --sys-root "$SYS_ROOT" \
+        --skip-stop >/dev/null
+
+    rm -f "$MOCK_STATE/containers_list_ids" "$MOCK_STATE/cmounts_c_adv_cid" "$MOCK_STATE/centrypoint_c_adv_cid" "$MOCK_STATE/ccmd_c_adv_cid"
+
+    REC_SH="$T18_TARGET/standalone/recreate_c_adv.sh"
+    if [ ! -f "$REC_SH" ]; then
+        echo "FAIL: 独立容器重建脚本 recreate_c_adv.sh 未生成！"
+        exit 1
+    fi
+
+    REC_BODY=$(cat "$REC_SH")
+
+    # 验证 --mount bind 参数
+    if ! echo "$REC_BODY" | grep -q -- "--mount 'type=bind,source=$T18_ROUTER_BIND,target=/container_data'"; then
+        echo "FAIL: 重建脚本中未正确包含 bind 类型的 --mount 参数: $REC_BODY"
+        exit 1
+    fi
+
+    # 验证 --mount volume 参数
+    if ! echo "$REC_BODY" | grep -q -- "--mount 'type=volume,source=my_data_vol,target=/vol_data'"; then
+        echo "FAIL: 重建脚本中未正确包含 volume 类型的 --mount 参数: $REC_BODY"
+        exit 1
+    fi
+
+    # 验证首个 entrypoint token 设为 --entrypoint
+    if ! echo "$REC_BODY" | grep -q -- "--entrypoint '/bin/sh'"; then
+        echo "FAIL: 重建脚本中未正确提取首个入口点为 --entrypoint: $REC_BODY"
+        exit 1
+    fi
+
+    # 验证后续 entrypoint token ('-c') 与 cmd 放在镜像名称之后
+    if ! echo "$REC_BODY" | grep -qE "'alpine:latest'[[:space:]]+'-c'[[:space:]]+'echo'[[:space:]]+'hello_ax6600'"; then
+        echo "FAIL: 重建脚本中 entrypoint 后续参数与 cmd 顺序错误: $REC_BODY"
+        exit 1
+    fi
+)
+echo "PASS: 测试 18 通过（HostConfig.Mounts 与多段 Entrypoint/Cmd 组合被精准还原）"
+
+# -----------------------------------------------------------------------------
+# 测试 19: 分区预检 sysfs 权威判定与反例测试
+# -----------------------------------------------------------------------------
+echo "--- 测试 19: 分区预检 sysfs 权威判定与反例测试 ---"
+(
+    IMG_FILE="$TEST_SANDBOX/test_fw19.bin"
+    head -c 10485760 /dev/zero > "$IMG_FILE"
+    SHA_EXPECTED=$(sha256sum "$IMG_FILE" | awk '{print $1}')
+
+    # 19a: 0:BOOTCONFIG 分区不可读/损坏时，严禁盲猜，必须严格报错退出
+    rm -f "$SYS_ROOT/dev/mmcblk0p2" "$MOCK_STATE/fdisk_mode"
+    set +e
+    sh "$HELPER_SCRIPT" precheck "$IMG_FILE" "$SHA_EXPECTED" --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t19_bootconf_fail.log"
+    ret=$?
+    set -e
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 0:BOOTCONFIG 不可读时预检竟然放行！"
+        exit 1
+    fi
+    if ! grep -q "无法从 0:BOOTCONFIG 分区读取启动配置标记" "$TEST_SANDBOX/t19_bootconf_fail.log"; then
+        echo "FAIL: 0:BOOTCONFIG 缺失报错不符合预期: $(cat "$TEST_SANDBOX/t19_bootconf_fail.log")"
+        exit 1
+    fi
+
+    # 19b: 目标对侧 _1 分区缺失时，严禁向其他分区借用扇区容量，必须严格退出
+    echo "missing_partitions" > "$MOCK_STATE/fdisk_mode"
+    mkdir -p "$SYS_ROOT/dev"
+    head -c 148 /dev/zero > "$SYS_ROOT/dev/mmcblk0p2"
+    printf '\x01' >> "$SYS_ROOT/dev/mmcblk0p2"
+    head -c 363 /dev/zero >> "$SYS_ROOT/dev/mmcblk0p2"
+
+    set +e
+    sh "$HELPER_SCRIPT" precheck "$IMG_FILE" "$SHA_EXPECTED" --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t19_missing_target.log"
+    ret=$?
+    set -e
+    rm -f "$MOCK_STATE/fdisk_mode" "$SYS_ROOT/dev/mmcblk0p2"
+
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 目标 _1 分区不存在时预检竟然放行！"
+        exit 1
+    fi
+    if ! grep -q "禁止借用其他分区容量或盲刷" "$TEST_SANDBOX/t19_missing_target.log"; then
+        echo "FAIL: 目标分区缺失报错不符合预期: $(cat "$TEST_SANDBOX/t19_missing_target.log")"
+        exit 1
+    fi
+
+    # 19c: 通过 sysfs uevent 和 size 获取 GPT 分区信息（即使 fdisk 无 Name 列也能正常工作）
+    mkdir -p "$SYS_ROOT/sys/class/block/mmcblk0p13" "$SYS_ROOT/sys/class/block/mmcblk0p14" \
+             "$SYS_ROOT/sys/class/block/mmcblk0p15" "$SYS_ROOT/sys/class/block/mmcblk0p16" \
+             "$SYS_ROOT/sys/class/block/mmcblk0p2"
+
+    printf 'PARTNAME=0:BOOTCONFIG\nDEVNAME=mmcblk0p2\n' > "$SYS_ROOT/sys/class/block/mmcblk0p2/uevent"
+    echo 512 > "$SYS_ROOT/sys/class/block/mmcblk0p2/size"
+
+    printf 'PARTNAME=0:HLOS\nDEVNAME=mmcblk0p13\n' > "$SYS_ROOT/sys/class/block/mmcblk0p13/uevent"
+    echo 32768 > "$SYS_ROOT/sys/class/block/mmcblk0p13/size"
+
+    printf 'PARTNAME=0:HLOS_1\nDEVNAME=mmcblk0p14\n' > "$SYS_ROOT/sys/class/block/mmcblk0p14/uevent"
+    echo 32768 > "$SYS_ROOT/sys/class/block/mmcblk0p14/size"
+
+    printf 'PARTNAME=rootfs\nDEVNAME=mmcblk0p15\n' > "$SYS_ROOT/sys/class/block/mmcblk0p15/uevent"
+    echo 1048576 > "$SYS_ROOT/sys/class/block/mmcblk0p15/size"
+
+    printf 'PARTNAME=rootfs_1\nDEVNAME=mmcblk0p16\n' > "$SYS_ROOT/sys/class/block/mmcblk0p16/uevent"
+    echo 1048576 > "$SYS_ROOT/sys/class/block/mmcblk0p16/size"
+
+    # 构造有效 0:BOOTCONFIG (标记为 1 -> 写入 _1)
+    head -c 148 /dev/zero > "$SYS_ROOT/dev/mmcblk0p2"
+    printf '\x01' >> "$SYS_ROOT/dev/mmcblk0p2"
+    head -c 363 /dev/zero >> "$SYS_ROOT/dev/mmcblk0p2"
+
+    # 执行预检，应通过 sysfs 成功探测分区容量
+    sh "$HELPER_SCRIPT" precheck "$IMG_FILE" "$SHA_EXPECTED" --sys-root "$SYS_ROOT" >"$TEST_SANDBOX/t19_sysfs_ok.log" 2>&1
+    if ! grep -q "目标根文件系统: \[rootfs_1\]" "$TEST_SANDBOX/t19_sysfs_ok.log"; then
+        echo "FAIL: sysfs 分区探测未成功解析出目标分区: $(cat "$TEST_SANDBOX/t19_sysfs_ok.log")"
+        exit 1
+    fi
+
+    # 19d: 固件包内实际 kernel 大小超过目标内核分区容量时必须阻断
+    TAR_FW="$TEST_SANDBOX/large_kernel_fw.bin"
+    T_PAYLOAD="$TEST_SANDBOX/payload_tmp"
+    mkdir -p "$T_PAYLOAD"
+    # 内核分区是 32768 扇区 = 16MB，创建一个 20MB 的 kernel 文件
+    head -c 20971520 /dev/zero > "$T_PAYLOAD/kernel"
+    head -c 1048576 /dev/zero > "$T_PAYLOAD/root"
+    (cd "$T_PAYLOAD" && tar -cf "$TAR_FW" kernel root)
+    rm -rf "$T_PAYLOAD"
+    TAR_SHA=$(sha256sum "$TAR_FW" | awk '{print $1}')
+
+    set +e
+    sh "$HELPER_SCRIPT" precheck "$TAR_FW" "$TAR_SHA" --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t19_large_kern.log"
+    ret=$?
+    set -e
+    rm -rf "$SYS_ROOT/sys/class/block/mmcblk0p*" "$SYS_ROOT/dev/mmcblk0p2"
+
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 固件实际内核大小 (20MB) 超过目标内核分区 (16MB)，预检竟然放行！"
+        exit 1
+    fi
+    if ! grep -q "超过目标内核分区" "$TEST_SANDBOX/t19_large_kern.log"; then
+        echo "FAIL: 超大内核报错信息不符合预期: $(cat "$TEST_SANDBOX/t19_large_kern.log")"
+        exit 1
+    fi
+)
+echo "PASS: 测试 19 通过（BOOTCONFIG 缺失严格阻断、无目标分区不借用、sysfs 权威解析与超大内核阻断）"
+
+# -----------------------------------------------------------------------------
+# 测试 20: 恢复阶段同挂载点聚合未压缩容量核验
+# -----------------------------------------------------------------------------
+echo "--- 测试 20: 恢复阶段同挂载点聚合容量校验 ---"
+(
+    T20_BKP="$TEST_SANDBOX/t20_bkp"
+    T20_DATA="$TEST_SANDBOX/t20_dst_docker"
+    T20_COMP="$SYS_ROOT/t20_compose"
+    T20_BIND="$SYS_ROOT/t20_bind"
+    mkdir -p "$T20_BKP/metadata" "$T20_BKP/config/etc_docker" "$T20_BKP/compose" "$T20_DATA" "$T20_COMP" "$T20_BIND"
+
+    # 创建各组件极小的压缩包
+    touch "$T20_BKP/config/config_dockerd" "$T20_BKP/config/config_dockerman" "$T20_BKP/config/etc_docker/daemon.json"
+    tar -czf "$T20_BKP/docker_volumes.tar.gz" -T /dev/null 2>/dev/null || touch "$T20_BKP/docker_volumes.tar.gz"
+    tar -czf "$T20_BKP/compose/proj20.tar.gz" -T /dev/null 2>/dev/null || touch "$T20_BKP/compose/proj20.tar.gz"
+    tar -czf "$T20_BKP/docker_bind_mounts.tar.gz" -T /dev/null 2>/dev/null || touch "$T20_BKP/docker_bind_mounts.tar.gz"
+
+    echo "proj20	/t20_compose	/t20_compose/docker-compose.yml" > "$T20_BKP/metadata/compose_manifest.tsv"
+    echo "/t20_bind" > "$T20_BKP/metadata/bind_mounts.txt"
+
+    # 在 uncompressed_sizes.tsv 中记录解压需求：
+    # 模拟 DataRoot 需要 4GB (4194304KB), Compose 需要 4GB (4194304KB), Bind 需要 4GB (4194304KB)
+    # 累加总计 12GB (12582912KB)
+    # 而 /mnt/sda1 在 mock df 中可用空间仅为 9437184KB (9GB)
+    cat << 'EOF' > "$T20_BKP/metadata/uncompressed_sizes.tsv"
+volumes	docker_volumes.tar.gz	4194304
+compose	proj20	4194304
+bind	/t20_bind	4194304
+EOF
+
+    # 生成校验清单
+    (
+        cd "$T20_BKP"
+        echo "dummy_manifest" > backup_manifest.txt
+        find . -type f ! -name "sha256sums.txt" | sed 's|^\./||' | xargs sha256sum > sha256sums.txt
+    )
+
+    set +e
+    sh "$HELPER_SCRIPT" restore \
+        --backup-dir "$T20_BKP" \
+        --target-data-root "$T20_DATA" \
+        --sys-root "$SYS_ROOT" 2>"$TEST_SANDBOX/t20_agg_space.log"
+    ret=$?
+    set -e
+
+    if [ "$ret" -eq 0 ]; then
+        echo "FAIL: 恢复阶段同挂载点聚合未压缩空间超限，竟然未被拦截！"
+        exit 1
+    fi
+    if ! grep -qiE "(存储空间不足|可用空间不足)" "$TEST_SANDBOX/t20_agg_space.log"; then
+        echo "FAIL: 聚合空间不足报错不符合预期: $(cat "$TEST_SANDBOX/t20_agg_space.log")"
+        exit 1
+    fi
+)
+echo "PASS: 测试 20 通过（同挂载点多组件未压缩体积累加超额被严格阻断）"
+
+# -----------------------------------------------------------------------------
+# 测试 21: PassWall2 活动核心动态反查与子目录 ACL 深度识别
+# -----------------------------------------------------------------------------
+echo "--- 测试 21: PassWall2 活动核心动态反查与 ACL 深度识别 ---"
+(
+    PW_DIR="$SYS_ROOT/var/etc/passwall2/ACL"
+    mkdir -p "$PW_DIR" "$SYS_ROOT/proc/8888"
+
+    # 在 ACL 子目录下生成包含 SOCKS 监听端口 2080 的 sing-box 配置
+    cat << 'EOF' > "$PW_DIR/singbox_acl_rule.json"
+{
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+
+    # 模拟 sing-box 进程 (PID 8888)，并将命令行指向 ACL 子目录下的配置文件
+    printf 'sing-box\0run\0-c\0/var/etc/passwall2/ACL/singbox_acl_rule.json\0' > "$SYS_ROOT/proc/8888/cmdline"
+    touch "$MOCK_STATE/pgrep_running_sing-box"
+    echo "8888" > "$MOCK_STATE/pgrep_pid_sing-box"
+
+    # 执行 PassWall2 验证
+    PW_OUT=$(sh "$HELPER_SCRIPT" verify passwall --sys-root "$SYS_ROOT" 2>&1 || true)
+    rm -rf "$SYS_ROOT/var/etc/passwall2" "$SYS_ROOT/proc/8888" "$MOCK_STATE/pgrep_running_sing-box" "$MOCK_STATE/pgrep_pid_sing-box"
+
+    # 验证是否成功从 ACL 子目录中提取出 2080 端口发起请求
+    if ! echo "$PW_OUT" | grep -q "2080"; then
+        echo "FAIL: 未能成功从 ACL 深度子目录配置文件中定位到 SOCKS 本地端口 2080: $PW_OUT"
+        exit 1
+    fi
+)
+echo "PASS: 测试 21 通过（PassWall2 动态反查进程 cmdline 且递归识别 ACL 深层子目录配置）"
+
+echo "=== 全部 21 项深度隔离测试与回归演练已通过！ ==="
+
